@@ -49,17 +49,46 @@ def simple_accuracy(preds, labels):
     return (preds == labels).mean()
 
 
-def save_model(args, model):
+def top_k_accuracy(logits, labels, k=5):
+    """
+    Computes top-k accuracy.
+    
+    Args:
+        logits: numpy array of shape (N, num_classes) - raw model outputs
+        labels: numpy array of shape (N,) - ground truth labels
+        k: number of top predictions to consider
+    
+    Returns:
+        float: top-k accuracy
+    """
+    # Get top-k predictions
+    top_k_preds = np.argsort(logits, axis=1)[:, -k:]  # Shape: (N, k)
+    
+    # Check if true label is in top-k predictions
+    correct = 0
+    for i, label in enumerate(labels):
+        if label in top_k_preds[i]:
+            correct += 1
+    
+    return correct / len(labels)
+
+
+def save_model(args, model, epoch, best=False):
     config = CONFIGS[args.model_type]
     config.num_classes = args.num_classes
     config.img_size = args.img_size
     config.num_frames = args.num_frames
     
-    
     model_to_save = model
-    model_checkpoint = os.path.join(args.output_dir, "%s_checkpoint.bin" % args.name)
+    
+    if best:
+        model_checkpoint = os.path.join(args.output_dir, "%s_best.bin" % args.name)
+    else:
+        model_checkpoint = os.path.join(args.output_dir, "%s_epoch_%d.bin" % (args.name, epoch))
+    
     torch.save({
             'config': config,
+            'epoch': epoch,
             'model_state_dict': model_to_save.state_dict()
             }, model_checkpoint)
 
@@ -73,7 +102,6 @@ def setup(args):
 
     num_classes = 10 if args.dataset == "cifar10" else 100
 
-    
     if args.dataset == "cifar10" or args.dataset == "cifar100":
         num_frames = 2
         num_classes = 10 if args.dataset == "cifar10" else 100
@@ -82,6 +110,7 @@ def setup(args):
         num_classes = args.num_classes
         
     model = MyViViT(config, args.img_size, num_classes=num_classes, num_frames=num_frames)
+
     model.load_from(np.load(args.pretrained_dir))
     model.to(args.device)
     num_params = count_parameters(model)
@@ -91,7 +120,6 @@ def setup(args):
     logger.info("Total Parameter: \t%2.1fM" % num_params)
     print(num_params)
 
-    
     return args, model
 
 
@@ -108,7 +136,7 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def valid(args, model, writer, test_loader, global_step):
+def valid(args, model, writer, test_loader, epoch, global_step):
     # Validation!
     eval_losses = AverageMeter()
 
@@ -117,7 +145,7 @@ def valid(args, model, writer, test_loader, global_step):
     logger.info("  Batch size = %d", args.eval_batch_size)
 
     model.eval()
-    all_preds, all_label = [], []
+    all_preds, all_label, all_logits = [], [], []
     epoch_iterator = tqdm(test_loader,
                           desc="Validating... (loss=X.X)",
                           bar_format="{l_bar}{r_bar}",
@@ -144,6 +172,7 @@ def valid(args, model, writer, test_loader, global_step):
         if len(all_preds) == 0:
             all_preds.append(preds.detach().cpu().numpy())
             all_label.append(y.detach().cpu().numpy())
+            all_logits.append(logits.detach().cpu().numpy())
         else:
             all_preds[0] = np.append(
                 all_preds[0], preds.detach().cpu().numpy(), axis=0
@@ -151,20 +180,35 @@ def valid(args, model, writer, test_loader, global_step):
             all_label[0] = np.append(
                 all_label[0], y.detach().cpu().numpy(), axis=0
             )
+            all_logits[0] = np.append(
+                all_logits[0], logits.detach().cpu().numpy(), axis=0
+            )
         epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
 
-    all_preds, all_label = all_preds[0], all_label[0]
-    accuracy = simple_accuracy(all_preds, all_label)
+    all_preds, all_label, all_logits = all_preds[0], all_label[0], all_logits[0]
+    
+    # Calculate Top-1 accuracy
+    top1_accuracy = simple_accuracy(all_preds, all_label)
+    
+    # Calculate Top-5 accuracy
+    # Adjust k based on number of classes (can't have top-5 if fewer than 5 classes)
+    num_classes = all_logits.shape[1]
+    k = min(5, num_classes)
+    top5_accuracy = top_k_accuracy(all_logits, all_label, k=k)
 
     logger.info("\n")
-    logger.info("Validation Results")
-    logger.info("Global Steps: %d" % global_step)
+    logger.info("Validation Results - Epoch %d" % epoch)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
-    logger.info("Valid Accuracy: %2.5f" % accuracy)
+    logger.info("Valid Top-1 Accuracy: %2.5f" % top1_accuracy)
+    logger.info("Valid Top-5 Accuracy: %2.5f" % top5_accuracy)
 
-    writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
-    return accuracy
-
+    writer.add_scalar("test/top1_accuracy", scalar_value=top1_accuracy, global_step=global_step)
+    writer.add_scalar("test/top5_accuracy", scalar_value=top5_accuracy, global_step=global_step)
+    writer.add_scalar("test/loss", scalar_value=eval_losses.avg, global_step=global_step)
+    writer.add_scalar("test/top1_accuracy_by_epoch", scalar_value=top1_accuracy, global_step=epoch)
+    writer.add_scalar("test/top5_accuracy_by_epoch", scalar_value=top5_accuracy, global_step=epoch)
+    
+    return top1_accuracy, top5_accuracy
 
 
 def train(args, model):
@@ -178,12 +222,16 @@ def train(args, model):
     # Prepare dataset
     train_loader, test_loader = get_loader(args)
 
+    # Calculate total steps based on epochs
+    steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+    t_total = steps_per_epoch * args.num_epochs
+
     # Prepare optimizer and scheduler
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.learning_rate,
                                 momentum=0.9,
                                 weight_decay=args.weight_decay)
-    t_total = args.num_steps
+    
     if args.decay_type == "cosine":
         scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
     else:
@@ -201,7 +249,9 @@ def train(args, model):
 
     # Train!
     logger.info("***** Running training *****")
-    logger.info("  Total optimization steps = %d", args.num_steps)
+    logger.info("  Num epochs = %d", args.num_epochs)
+    logger.info("  Steps per epoch = %d", steps_per_epoch)
+    logger.info("  Total optimization steps = %d", t_total)
     logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
     logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
                 args.train_batch_size * args.gradient_accumulation_steps * (
@@ -210,15 +260,21 @@ def train(args, model):
 
     model.zero_grad()
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
-    losses = AverageMeter()
-    global_step, best_acc = 0, 0
-    while True:
+    
+    global_step = 0
+    best_top1_acc = 0
+    best_top5_acc = 0
+    
+    for epoch in range(1, args.num_epochs + 1):
         model.train()
+        losses = AverageMeter()
+        
         epoch_iterator = tqdm(train_loader,
-                              desc="Training (X / X Steps) (loss=X.X)",
+                              desc=f"Epoch {epoch}/{args.num_epochs} (loss=X.X)",
                               bar_format="{l_bar}{r_bar}",
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
+        
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
@@ -239,7 +295,7 @@ def train(args, model):
                 loss.backward()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                losses.update(loss.item()*args.gradient_accumulation_steps)
+                losses.update(loss.item() * args.gradient_accumulation_steps)
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
@@ -250,27 +306,37 @@ def train(args, model):
                 global_step += 1
 
                 epoch_iterator.set_description(
-                    "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, losses.val)
+                    f"Epoch {epoch}/{args.num_epochs} (loss={losses.val:.5f})"
                 )
+                
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
-                if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                    accuracy = valid(args, model, writer, test_loader, global_step)
-                    if best_acc < accuracy:
-                        save_model(args, model)
-                        best_acc = accuracy
-                    model.train()
 
-                if global_step % t_total == 0:
-                    break
-        losses.reset()
-        if global_step % t_total == 0:
-            break
+        # End of epoch logging
+        logger.info(f"Epoch {epoch}/{args.num_epochs} completed - Average Loss: {losses.avg:.5f}")
+        
+        if args.local_rank in [-1, 0]:
+            writer.add_scalar("train/epoch_loss", scalar_value=losses.avg, global_step=epoch)
+            
+            # Validation at the end of each epoch
+            top1_accuracy, top5_accuracy = valid(args, model, writer, test_loader, epoch, global_step)
+            
+            # Save best model based on top-1 accuracy
+            if best_top1_acc < top1_accuracy:
+                save_model(args, model, epoch, best=True)
+                best_top1_acc = top1_accuracy
+                best_top5_acc = top5_accuracy
+                logger.info(f"New best Top-1 accuracy: {best_top1_acc:.5f}, Top-5 accuracy: {best_top5_acc:.5f}")
+            
+            # Save checkpoint every epoch (changed default behavior)
+            if args.save_every > 0 and epoch % args.save_every == 0:
+                save_model(args, model, epoch, best=False)
 
     if args.local_rank in [-1, 0]:
         writer.close()
-    logger.info("Best Accuracy: \t%f" % best_acc)
+    logger.info("Best Top-1 Accuracy: \t%f" % best_top1_acc)
+    logger.info("Best Top-5 Accuracy: \t%f" % best_top5_acc)
     logger.info("End Training!")
 
 
@@ -281,8 +347,8 @@ def main():
                         help="Name of this run. Used for monitoring.")
     parser.add_argument("--dataset", choices=["cifar10", "cifar100","custom"], default="cifar10",
                         help="Which downstream task.")
-    parser.add_argument("--model_type", choices=["ViViT-B/16x2","ViViT-B/16x2-small"],
-                        default="ViViT-B/16x2-small",
+    parser.add_argument("--model_type", choices=["ViViT-B/16x2","ViViT-B/16x2-small", "ViViT-L/16x2"],
+                        default="ViViT-L/16x2",
                         help="Which variant to use.")
     parser.add_argument("--pretrained_dir", type=str, default="ViT-B_16.npz",
                         help="Where to search for pretrained ViT models.")
@@ -295,7 +361,6 @@ def main():
     parser.add_argument("--num_classes", default=2, type=int,
                         help="number of class")
 
-
     parser.add_argument("--img_size", default=224, type=int,
                         help="Resolution size")
     parser.add_argument("--num_frames", default=32, type=int,
@@ -304,24 +369,25 @@ def main():
                         help="Total batch size for training.")
     parser.add_argument("--eval_batch_size", default=64, type=int,
                         help="Total batch size for eval.")
-    parser.add_argument("--eval_every", default=100, type=int,
-                        help="Run prediction on validation set every so many steps."
-                             "Will always run one evaluation at the end of training.")
 
     parser.add_argument("--learning_rate", default=3e-2, type=float,
                         help="The initial learning rate for SGD.")
     parser.add_argument("--weight_decay", default=0, type=float,
-                        help="Weight deay if we apply some.")
+                        help="Weight decay if we apply some.")
     parser.add_argument("--label_smoothing", default=0, type=float,
                         help="label smoothing p.")
-    parser.add_argument("--num_steps", default=10000, type=int,
+    parser.add_argument("--num_epochs", default=10, type=int,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--decay_type", choices=["cosine", "linear"], default="cosine",
                         help="How to decay the learning rate.")
     parser.add_argument("--warmup_steps", default=500, type=int,
                         help="Step of training to perform learning rate warmup for.")
+    parser.add_argument("--warmup_epochs", default=0, type=int,
+                        help="Number of warmup epochs (overrides warmup_steps if > 0).")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
+    parser.add_argument("--save_every", default=1, type=int,
+                        help="Save checkpoint every N epochs (0 = only save best).")
 
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="local_rank for distributed training on gpus")

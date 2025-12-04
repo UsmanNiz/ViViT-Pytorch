@@ -14,33 +14,88 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+class VideoTransformWrapper(object):
+    """Wrapper to apply image transforms to video tensors (T, C, H, W)"""
+    def __init__(self, transform):
+        self.transform = transform
+        self.transform_name = transform.__class__.__name__
+    
+    def __call__(self, x):
+        # print(f"[DEBUG VideoTransformWrapper] Applying {self.transform_name}, input shape: {x.shape}")
+        # If it's a video tensor (T, C, H, W) with T > 1
+        if x.dim() == 4 and x.shape[0] > 1:
+            # Apply transform to each frame
+            transformed_frames = []
+            for t in range(x.shape[0]):
+                frame_result = self.transform(x[t])
+                transformed_frames.append(frame_result)
+            result = torch.stack(transformed_frames, dim=0)
+            # print(f"[DEBUG VideoTransformWrapper] Final video shape: {result.shape}")
+            return result
+        else:
+            # Single frame or image
+            result = self.transform(x)
+            # print(f"[DEBUG VideoTransformWrapper] Single frame result shape: {result.shape}")
+            return result
+
+
 class MyRotateTransform(object):
     def __init__(self, angles):
         self.angles = angles
 
     def __call__(self, x):
         angle = np.random.choice(self.angles, p=[0.8, 0.2])
-        return F.rotate(x, angle)
+        # Convert numpy scalar to Python float/int (required by torchvision)
+        angle = float(angle) if isinstance(angle, (np.integer, np.floating)) else angle
+        # print(f"[DEBUG MyRotateTransform] Rotating video by {angle} degrees, input shape: {x.shape}, dtype: {x.dtype}")
+        
+        # Convert to float32 if needed (rotation doesn't support float16 on CPU)
+        original_dtype = x.dtype
+        if x.dtype == torch.float16:
+            x = x.float()
+            # print(f"[DEBUG MyRotateTransform] Converted to float32 for rotation")
+        
+        # Handle video tensors: (T, C, H, W) - apply rotation to each frame
+        if x.dim() == 4 and x.shape[0] > 1:  # Video tensor (T, C, H, W)
+            # print(f"[DEBUG MyRotateTransform] Processing video tensor with {x.shape[0]} frames")
+            # Apply rotation to each frame
+            rotated_frames = []
+            for t in range(x.shape[0]):
+                rotated_frames.append(F.rotate(x[t], angle))
+            result = torch.stack(rotated_frames, dim=0)
+        else:
+            # Single frame or image
+            # print(f"[DEBUG MyRotateTransform] Processing single frame/image")
+            result = F.rotate(x, angle)
+        
+        # Convert back to original dtype if needed
+        if original_dtype == torch.float16:
+            result = result.half()
+            # print(f"[DEBUG MyRotateTransform] Converted back to float16")
+        
+        # print(f"[DEBUG MyRotateTransform] Output shape: {result.shape}, dtype: {result.dtype}")
+        return result
     
 
 
 data_transforms = {
 
 'train': T.Compose([
-	T.RandomResizedCrop(size=(224,224), scale=(0.7,1), ratio=(5/4,5/3)),
-	T.RandomHorizontalFlip(),
+	VideoTransformWrapper(T.Resize((256, 256))),  # Resize first to ensure minimum size
+	VideoTransformWrapper(T.RandomCrop((224, 224))),  # Then crop to exact size
+	VideoTransformWrapper(T.RandomHorizontalFlip()),
 	MyRotateTransform([0, 180]),
-	T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+	VideoTransformWrapper(T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]))
 ]),
 
 'val': T.Compose([
-	T.RandomResizedCrop(size=(224,224), scale=(1,1), ratio=(5/4,5/3)),
-	T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+	VideoTransformWrapper(T.Resize((224, 224))),  # Use Resize instead of RandomResizedCrop for consistent sizing
+	VideoTransformWrapper(T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]))
 ]),
 
 'test': T.Compose([
-	T.RandomResizedCrop(size=(224,224), scale=(1,1)),
-	T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+	VideoTransformWrapper(T.Resize((224, 224))),  # Use Resize instead of RandomResizedCrop for consistent sizing
+	VideoTransformWrapper(T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]))
 ])
 }
 

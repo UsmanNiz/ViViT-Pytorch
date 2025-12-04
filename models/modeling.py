@@ -158,6 +158,10 @@ class Embeddings3D(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1)
         
         if not self.temporal:
+            # print(f"[DEBUG Embeddings3D] x shape: {x.shape}")
+            # print(f"[DEBUG Embeddings3D] tubelet_embedding shape: {self.tubelet_embedding.weight.shape}")
+            # print(f"[DEBUG Embeddings3D] x dtype: {x.dtype}")
+            # x = x.float()
             x = self.tubelet_embedding(x)
             x = x.flatten(2)
             x = x.transpose(-1, -2)
@@ -362,5 +366,6 @@ class MyViViT(nn.Module):
 
 CONFIGS = {
     'ViViT-B/16x2': configs.get_vb16_config(),
-    'ViViT-B/16x2-small': configs.get_vb16_config_small()
+    'ViViT-B/16x2-small': configs.get_vb16_config_small(),
+    'ViViT-L/16x2': configs.get_vl16_config()
 }
