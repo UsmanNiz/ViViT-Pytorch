@@ -127,7 +127,7 @@ class CustomDataset(torch.utils.data.Dataset):
 		# print(f"[DEBUG __getitem__] Applying transforms to video: {vid}")
 		with torch.no_grad():
 			if self.label_path != None:
-				label = self.labels[self.labels["fname"] == vid]["liveness_score"].item()
+				label = self.labels[self.labels["fname"] == vid]["class_id"].item()
 				video = torch.tensor(video, dtype=torch.float32)
 			else:
 				label = None

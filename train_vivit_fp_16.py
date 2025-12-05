@@ -475,11 +475,11 @@ def main():
     parser.add_argument("--eval_batch_size", default=8, type=int,
                         help="Total batch size for eval.")
 
-    parser.add_argument("--learning_rate", default=0.1, type=float,
+    parser.add_argument("--learning_rate", default=0.001, type=float,
                         help="The initial learning rate for SGD.")
     parser.add_argument("--weight_decay", default=0, type=float,
                         help="Weight decay if we apply some.")
-    parser.add_argument("--label_smoothing", default=0.3, type=float,
+    parser.add_argument("--label_smoothing", default=0.1, type=float,
                         help="label smoothing p.")
     parser.add_argument("--num_epochs", default=35, type=int,
                         help="Total number of training epochs to perform.")
@@ -487,15 +487,15 @@ def main():
                         help="How to decay the learning rate.")
     parser.add_argument("--warmup_steps", default=500, type=int,
                         help="Step of training to perform learning rate warmup for.")
-    parser.add_argument("--warmup_epochs", default=2.5, type=float,
+    parser.add_argument("--warmup_epochs", default=5, type=float,
                         help="Number of warmup epochs (overrides warmup_steps if > 0).")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
     parser.add_argument("--save_every", default=1, type=int,
                         help="Save checkpoint every N epochs (0 = only save best).")
-    parser.add_argument("--save_every_steps", default=50, type=int,
+    parser.add_argument("--save_every_steps", default=0, type=int,
                         help="Save checkpoint every N steps (0 = disabled).")
-    parser.add_argument("--eval_every_steps", default=50, type=int,
+    parser.add_argument("--eval_every_steps", default=0, type=int,
                         help="Run quick validation every N steps (0 = only at epoch end).")
 
     # Resume training
