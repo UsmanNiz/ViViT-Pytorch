@@ -1,4 +1,8 @@
 # coding=utf-8
+"""
+ViViT Training Script with Native PyTorch AMP (No Apex Required!)
+Now with text file logging!
+"""
 from __future__ import absolute_import, division, print_function
 
 import logging
@@ -6,17 +10,15 @@ import argparse
 import os
 import random
 import numpy as np
-
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import autocast, GradScaler  # Native PyTorch AMP - No Apex needed!
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from apex import amp
-from apex.parallel import DistributedDataParallel as DDP
 
 from models.modeling import CONFIGS, MyViViT
 
@@ -46,6 +48,51 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
+class TextLogger:
+    """Simple text file logger for training metrics"""
+    def __init__(self, log_path, args):
+        self.log_path = log_path
+        self.file = open(log_path, "a")  # Append mode for resume
+        
+        # Write header
+        self.file.write("=" * 100 + "\n")
+        self.file.write(f"Training started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        self.file.write(f"Experiment: {args.name}\n")
+        self.file.write("-" * 100 + "\n")
+        self.file.write(f"Model: {args.model_type}\n")
+        self.file.write(f"Dataset: {args.dataset}\n")
+        self.file.write(f"Num classes: {args.num_classes}\n")
+        self.file.write(f"Num frames: {args.num_frames}\n")
+        self.file.write(f"Batch size: {args.train_batch_size}\n")
+        self.file.write(f"Learning rate: {args.learning_rate}\n")
+        self.file.write(f"Label smoothing: {args.label_smoothing}\n")
+        self.file.write(f"Warmup epochs: {args.warmup_epochs}\n")
+        self.file.write(f"Total epochs: {args.num_epochs}\n")
+        self.file.write(f"FP16: {args.fp16}\n")
+        self.file.write("=" * 100 + "\n\n")
+        
+        # Write column headers
+        self.file.write(f"{'Step':<10}{'Epoch':<8}{'Train Loss':<14}{'Val Loss':<14}{'Top1 Acc':<12}{'Top5 Acc':<12}{'LR':<14}{'Note'}\n")
+        self.file.write("-" * 100 + "\n")
+        self.file.flush()
+    
+    def log(self, step, epoch, train_loss, val_loss, top1_acc, top5_acc, lr, note=""):
+        self.file.write(f"{step:<10}{epoch:<8}{train_loss:<14.5f}{val_loss:<14.5f}{top1_acc:<12.5f}{top5_acc:<12.5f}{lr:<14.8f}{note}\n")
+        self.file.flush()
+    
+    def log_message(self, message):
+        self.file.write(f">>> {message}\n")
+        self.file.flush()
+    
+    def close(self, best_top1_acc, best_top5_acc):
+        self.file.write("\n" + "=" * 100 + "\n")
+        self.file.write(f"Training completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        self.file.write(f"Best Top-1 Accuracy: {best_top1_acc:.5f}\n")
+        self.file.write(f"Best Top-5 Accuracy: {best_top5_acc:.5f}\n")
+        self.file.write("=" * 100 + "\n")
+        self.file.close()
+
+
 def simple_accuracy(preds, labels):
     return (preds == labels).mean()
 
@@ -53,28 +100,16 @@ def simple_accuracy(preds, labels):
 def top_k_accuracy(logits, labels, k=5):
     """
     Computes top-k accuracy.
-    
-    Args:
-        logits: numpy array of shape (N, num_classes) - raw model outputs
-        labels: numpy array of shape (N,) - ground truth labels
-        k: number of top predictions to consider
-    
-    Returns:
-        float: top-k accuracy
     """
-    # Get top-k predictions
-    top_k_preds = np.argsort(logits, axis=1)[:, -k:]  # Shape: (N, k)
-    
-    # Check if true label is in top-k predictions
+    top_k_preds = np.argsort(logits, axis=1)[:, -k:]
     correct = 0
     for i, label in enumerate(labels):
         if label in top_k_preds[i]:
             correct += 1
-    
     return correct / len(labels)
 
 
-def save_model(args, model, optimizer, scheduler, epoch, global_step, best_top1_acc, best_top5_acc, best=False, step_checkpoint=False):
+def save_model(args, model, optimizer, scheduler, scaler, epoch, global_step, best_top1_acc, best_top5_acc, best=False, step_checkpoint=False):
     """
     Save model checkpoint with all training state for resume capability.
     """
@@ -83,17 +118,15 @@ def save_model(args, model, optimizer, scheduler, epoch, global_step, best_top1_
     config.img_size = args.img_size
     config.num_frames = args.num_frames
     
-    # Handle distributed model
     model_to_save = model.module if hasattr(model, 'module') else model
     
     if best:
-        model_checkpoint = os.path.join(args.output_dir, "%s_best.bin" % args.name)
+        model_checkpoint = os.path.join(args.output_dir, "%s_best.pth" % args.name)
     elif step_checkpoint:
-        model_checkpoint = os.path.join(args.output_dir, "%s_step_%d.bin" % (args.name, global_step))
+        model_checkpoint = os.path.join(args.output_dir, "%s_step_%d.pth" % (args.name, global_step))
     else:
-        model_checkpoint = os.path.join(args.output_dir, "%s_epoch_%d.bin" % (args.name, epoch))
+        model_checkpoint = os.path.join(args.output_dir, "%s_epoch_%d.pth" % (args.name, epoch))
     
-    # Save complete training state
     checkpoint = {
         'config': config,
         'epoch': epoch,
@@ -101,6 +134,7 @@ def save_model(args, model, optimizer, scheduler, epoch, global_step, best_top1_
         'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
         'best_top1_acc': best_top1_acc,
         'best_top5_acc': best_top5_acc,
         'args': args,
@@ -110,31 +144,28 @@ def save_model(args, model, optimizer, scheduler, epoch, global_step, best_top1_
     logger.info("Saved model checkpoint to [%s]", model_checkpoint)
 
 
-def load_checkpoint(args, model, optimizer=None, scheduler=None):
+def load_checkpoint(args, model, optimizer=None, scheduler=None, scaler=None):
     """
     Load checkpoint for resuming training.
-    
-    Returns:
-        start_epoch, global_step, best_top1_acc, best_top5_acc
     """
     logger.info(f"Loading checkpoint from {args.resume}")
     checkpoint = torch.load(args.resume, map_location=args.device, weights_only=False)
     
-    # Load model state
     model_to_load = model.module if hasattr(model, 'module') else model
     model_to_load.load_state_dict(checkpoint['model_state_dict'])
     
-    # Load optimizer state
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         logger.info("Loaded optimizer state")
     
-    # Load scheduler state
     if scheduler is not None and 'scheduler_state_dict' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         logger.info("Loaded scheduler state")
     
-    # Get training state
+    if scaler is not None and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        logger.info("Loaded scaler state")
+    
     start_epoch = checkpoint.get('epoch', 0)
     global_step = checkpoint.get('global_step', 0)
     best_top1_acc = checkpoint.get('best_top1_acc', 0)
@@ -147,11 +178,8 @@ def load_checkpoint(args, model, optimizer=None, scheduler=None):
 
 
 def setup(args):
-    # Prepare model
     config = CONFIGS[args.model_type]
     config.label_smoothing = args.label_smoothing
-
-    num_classes = 10 if args.dataset == "cifar10" else 100
 
     if args.dataset == "cifar10" or args.dataset == "cifar100":
         num_frames = 2
@@ -162,7 +190,6 @@ def setup(args):
         
     model = MyViViT(config, args.img_size, num_classes=num_classes, num_frames=num_frames)
     
-    # Only load pretrained weights if not resuming
     if args.resume is None:
         model.load_from(np.load(args.pretrained_dir))
     
@@ -190,12 +217,10 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def valid(args, model, writer, test_loader, epoch, global_step, full_eval=True):
+def valid(args, model, writer, test_loader, epoch, global_step, full_eval=True, scaler=None):
     """
-    Run validation.
-    
-    Args:
-        full_eval: If True, run full validation. If False, run quick validation (limited batches).
+    Run validation with optional FP16.
+    Returns: top1_accuracy, top5_accuracy, val_loss
     """
     eval_losses = AverageMeter()
 
@@ -207,7 +232,6 @@ def valid(args, model, writer, test_loader, epoch, global_step, full_eval=True):
     model.eval()
     all_preds, all_label, all_logits = [], [], []
     
-    # For quick eval, only use a few batches
     max_batches = len(test_loader) if full_eval else min(10, len(test_loader))
     
     epoch_iterator = tqdm(test_loader,
@@ -224,42 +248,38 @@ def valid(args, model, writer, test_loader, epoch, global_step, full_eval=True):
         batch = tuple(t.to(args.device) for t in batch)
         x, y = batch
         
-        # For handling images
         if x.dim() == 4:
             x = torch.unsqueeze(x, 1)
-            x = x.expand(-1,2,-1,-1,-1)
+            x = x.expand(-1, 2, -1, -1, -1)
+            
         with torch.no_grad():
-            logits = model(x)
+            # Use autocast for validation too if fp16 is enabled
+            if args.fp16:
+                with autocast():
+                    logits = model(x)
+                    eval_loss = loss_fct(logits, y)
+            else:
+                logits = model(x)
+                eval_loss = loss_fct(logits, y)
 
-            eval_loss = loss_fct(logits, y)
             eval_losses.update(eval_loss.item())
-
             preds = torch.argmax(logits, dim=-1)
 
         if len(all_preds) == 0:
             all_preds.append(preds.detach().cpu().numpy())
             all_label.append(y.detach().cpu().numpy())
-            all_logits.append(logits.detach().cpu().numpy())
+            all_logits.append(logits.float().detach().cpu().numpy())  # Convert to float for numpy
         else:
-            all_preds[0] = np.append(
-                all_preds[0], preds.detach().cpu().numpy(), axis=0
-            )
-            all_label[0] = np.append(
-                all_label[0], y.detach().cpu().numpy(), axis=0
-            )
-            all_logits[0] = np.append(
-                all_logits[0], logits.detach().cpu().numpy(), axis=0
-            )
+            all_preds[0] = np.append(all_preds[0], preds.detach().cpu().numpy(), axis=0)
+            all_label[0] = np.append(all_label[0], y.detach().cpu().numpy(), axis=0)
+            all_logits[0] = np.append(all_logits[0], logits.float().detach().cpu().numpy(), axis=0)
+            
         if full_eval:
             epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
 
     all_preds, all_label, all_logits = all_preds[0], all_label[0], all_logits[0]
     
-    # Calculate Top-1 accuracy
     top1_accuracy = simple_accuracy(all_preds, all_label)
-    
-    # Calculate Top-5 accuracy
-    # Adjust k based on number of classes (can't have top-5 if fewer than 5 classes)
     num_classes = all_logits.shape[1]
     k = min(5, num_classes)
     top5_accuracy = top_k_accuracy(all_logits, all_label, k=k)
@@ -271,28 +291,31 @@ def valid(args, model, writer, test_loader, epoch, global_step, full_eval=True):
         logger.info("Valid Top-1 Accuracy: %2.5f" % top1_accuracy)
         logger.info("Valid Top-5 Accuracy: %2.5f" % top5_accuracy)
 
-        writer.add_scalar("test/top1_accuracy", scalar_value=top1_accuracy, global_step=global_step)
-        writer.add_scalar("test/top5_accuracy", scalar_value=top5_accuracy, global_step=global_step)
-        writer.add_scalar("test/loss", scalar_value=eval_losses.avg, global_step=global_step)
-        writer.add_scalar("test/top1_accuracy_by_epoch", scalar_value=top1_accuracy, global_step=epoch)
-        writer.add_scalar("test/top5_accuracy_by_epoch", scalar_value=top5_accuracy, global_step=epoch)
+        writer.add_scalar("val/top1_accuracy", scalar_value=top1_accuracy, global_step=global_step)
+        writer.add_scalar("val/top5_accuracy", scalar_value=top5_accuracy, global_step=global_step)
+        writer.add_scalar("val/loss", scalar_value=eval_losses.avg, global_step=global_step)
     else:
-        # Quick eval - just print to console
         logger.info(f"[Step {global_step}] Quick Eval - Loss: {eval_losses.avg:.5f}, Top-1 Acc: {top1_accuracy:.5f}, Top-5 Acc: {top5_accuracy:.5f}")
-        writer.add_scalar("test/quick_top1_accuracy", scalar_value=top1_accuracy, global_step=global_step)
-        writer.add_scalar("test/quick_top5_accuracy", scalar_value=top5_accuracy, global_step=global_step)
+        writer.add_scalar("val/quick_top1_accuracy", scalar_value=top1_accuracy, global_step=global_step)
+        writer.add_scalar("val/quick_top5_accuracy", scalar_value=top5_accuracy, global_step=global_step)
     
-    # Set model back to train mode
     model.train()
     
-    return top1_accuracy, top5_accuracy
+    return top1_accuracy, top5_accuracy, eval_losses.avg
 
 
 def train(args, model):
     """ Train the model """
+    text_logger = None
+    
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
+        
+        # Initialize text logger
+        log_file_path = os.path.join(args.output_dir, f"{args.name}_training_log.txt")
+        text_logger = TextLogger(log_file_path, args)
+        logger.info(f"Text log will be saved to: {log_file_path}")
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -303,10 +326,10 @@ def train(args, model):
     steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
     t_total = steps_per_epoch * args.num_epochs
 
-    # Calculate warmup steps from warmup_epochs if specified
+    # Calculate warmup steps
     if args.warmup_epochs > 0:
         warmup_steps = int(steps_per_epoch * args.warmup_epochs)
-        logger.info(f"#####Using warmup_epochs={args.warmup_epochs}, calculated warmup_steps={warmup_steps}")
+        logger.info(f"Using warmup_epochs={args.warmup_epochs}, calculated warmup_steps={warmup_steps}")
     else:
         warmup_steps = args.warmup_steps
         logger.info(f"Using warmup_steps={warmup_steps}")
@@ -322,39 +345,34 @@ def train(args, model):
     else:
         scheduler = WarmupLinearSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
 
+    # Initialize GradScaler for FP16 training (Native PyTorch AMP)
+    scaler = GradScaler() if args.fp16 else None
+    if args.fp16:
+        logger.info("Using Native PyTorch AMP (FP16 training enabled)")
+
     # Initialize training state
     start_epoch = 0
     global_step = 0
     best_top1_acc = 0
     best_top5_acc = 0
-    
-    # For resume: track which step within epoch to skip to
     resume_step_in_epoch = 0
 
     # Resume from checkpoint if specified
     if args.resume is not None:
         start_epoch, global_step, best_top1_acc, best_top5_acc = load_checkpoint(
-            args, model, optimizer, scheduler
+            args, model, optimizer, scheduler, scaler
         )
-        # Calculate which step within the current epoch we should resume from
-        # If we saved mid-epoch, we need to skip those steps
         resume_step_in_epoch = global_step % steps_per_epoch
         if resume_step_in_epoch > 0:
             logger.info(f"Will skip first {resume_step_in_epoch} steps in epoch {start_epoch + 1}")
-
-    if args.fp16:
-        model, optimizer = amp.initialize(models=model,
-                                          optimizers=optimizer,
-                                          opt_level=args.fp16_opt_level)
-        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+        if text_logger:
+            text_logger.log_message(f"Resumed from epoch {start_epoch}, step {global_step}")
 
     # Multi-GPU setup
     if args.local_rank != -1:
-        # DistributedDataParallel (use with torchrun)
         model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
         logger.info(f"Using DistributedDataParallel on GPU {args.local_rank}")
     elif args.n_gpu > 1:
-        # DataParallel (simple multi-GPU)
         model = torch.nn.DataParallel(model)
         logger.info(f"Using DataParallel on {args.n_gpu} GPUs")
 
@@ -365,31 +383,21 @@ def train(args, model):
     logger.info("  Steps per epoch = %d", steps_per_epoch)
     logger.info("  Total optimization steps = %d", t_total)
     logger.info("  Warmup steps = %d", warmup_steps)
+    logger.info("  FP16 training = %s", args.fp16)
     logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
     logger.info("  Number of GPUs = %d", args.n_gpu if args.local_rank == -1 else torch.distributed.get_world_size())
     logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
                 args.train_batch_size * args.gradient_accumulation_steps * (
                     torch.distributed.get_world_size() if args.local_rank != -1 else max(1, args.n_gpu)))
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    if args.eval_every_steps > 0:
-        logger.info("  Eval every %d steps", args.eval_every_steps)
-    if args.save_every_steps > 0:
-        logger.info("  Save checkpoint every %d steps", args.save_every_steps)
-    
-    if args.resume is not None:
-        logger.info("  Resumed from checkpoint: %s", args.resume)
-        logger.info("  Resuming from global_step = %d", global_step)
-        logger.info("  Current best Top-1 Acc = %.5f", best_top1_acc)
-        logger.info("  Current best Top-5 Acc = %.5f", best_top5_acc)
 
     model.zero_grad()
-    set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
+    set_seed(args)
     
     for epoch in range(start_epoch + 1, args.num_epochs + 1):
         model.train()
         losses = AverageMeter()
         
-        # Set epoch for distributed sampler
         if args.local_rank != -1:
             train_loader.sampler.set_epoch(epoch)
         
@@ -400,40 +408,50 @@ def train(args, model):
                               disable=args.local_rank not in [-1, 0])
         
         for step, batch in enumerate(epoch_iterator):
-            # Skip steps if resuming mid-epoch (only for the first epoch after resume)
             if epoch == start_epoch + 1 and step < resume_step_in_epoch:
                 continue
             
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
             
-            # For handling images
             if x.dim() == 4:
                 x = torch.unsqueeze(x, 1)
-                x = x.expand(-1,2,-1,-1,-1)
+                x = x.expand(-1, 2, -1, -1, -1)
             
-            loss = model(x, y)
+            # Forward pass with autocast for FP16
+            if args.fp16:
+                with autocast():
+                    loss = model(x, y)
+            else:
+                loss = model(x, y)
             
-            # Handle DataParallel case where loss might be a tensor of multiple values
+            # Handle DataParallel
             if args.n_gpu > 1 and args.local_rank == -1:
-                loss = loss.mean()  # Average loss across GPUs
+                loss = loss.mean()
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
+            
+            # Backward pass
             if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
+                scaler.scale(loss).backward()
             else:
                 loss.backward()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 losses.update(loss.item() * args.gradient_accumulation_steps)
+                
+                # Gradient clipping and optimizer step
                 if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                
                 scheduler.step()
-                optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
 
@@ -445,44 +463,51 @@ def train(args, model):
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
                 
-                # Quick evaluation every N steps
+                # Quick evaluation
                 if args.eval_every_steps > 0 and global_step % args.eval_every_steps == 0:
                     if args.local_rank in [-1, 0]:
-                        valid(args, model, writer, test_loader, epoch, global_step, full_eval=False)
+                        top1, top5, val_loss = valid(args, model, writer, test_loader, epoch, global_step, full_eval=False, scaler=scaler)
+                        # Log to text file
+                        if text_logger:
+                            text_logger.log(global_step, epoch, losses.val, val_loss, top1, top5, scheduler.get_lr()[0], "quick_eval")
                 
-                # Save checkpoint every N steps (for testing resume)
+                # Save checkpoint
                 if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                     if args.local_rank in [-1, 0]:
-                        save_model(args, model, optimizer, scheduler, epoch, global_step,
+                        save_model(args, model, optimizer, scheduler, scaler, epoch, global_step,
                                   best_top1_acc, best_top5_acc, best=False, step_checkpoint=True)
 
-        # Reset resume_step_in_epoch after first epoch
         resume_step_in_epoch = 0
-        
-        # End of epoch logging
         logger.info(f"Epoch {epoch}/{args.num_epochs} completed - Average Loss: {losses.avg:.5f}")
         
         if args.local_rank in [-1, 0]:
             writer.add_scalar("train/epoch_loss", scalar_value=losses.avg, global_step=epoch)
             
-            # Full validation at the end of each epoch
-            top1_accuracy, top5_accuracy = valid(args, model, writer, test_loader, epoch, global_step, full_eval=True)
+            top1_accuracy, top5_accuracy, val_loss = valid(args, model, writer, test_loader, epoch, global_step, full_eval=True, scaler=scaler)
             
-            # Save best model based on top-1 accuracy
+            # Log epoch end to text file
+            if text_logger:
+                text_logger.log(global_step, epoch, losses.avg, val_loss, top1_accuracy, top5_accuracy, scheduler.get_lr()[0], "EPOCH_END")
+            
             if best_top1_acc < top1_accuracy:
-                save_model(args, model, optimizer, scheduler, epoch, global_step, 
+                save_model(args, model, optimizer, scheduler, scaler, epoch, global_step, 
                           top1_accuracy, top5_accuracy, best=True)
                 best_top1_acc = top1_accuracy
                 best_top5_acc = top5_accuracy
                 logger.info(f"New best Top-1 accuracy: {best_top1_acc:.5f}, Top-5 accuracy: {best_top5_acc:.5f}")
+                if text_logger:
+                    text_logger.log_message(f"NEW BEST MODEL! Top-1: {best_top1_acc:.5f}, Top-5: {best_top5_acc:.5f}")
             
-            # Save checkpoint every epoch (for resume capability)
             if args.save_every > 0 and epoch % args.save_every == 0:
-                save_model(args, model, optimizer, scheduler, epoch, global_step,
+                save_model(args, model, optimizer, scheduler, scaler, epoch, global_step,
                           best_top1_acc, best_top5_acc, best=False)
 
     if args.local_rank in [-1, 0]:
         writer.close()
+        if text_logger:
+            text_logger.close(best_top1_acc, best_top5_acc)
+            logger.info(f"Training log saved to: {log_file_path}")
+    
     logger.info("Best Top-1 Accuracy: \t%f" % best_top1_acc)
     logger.info("Best Top-5 Accuracy: \t%f" % best_top5_acc)
     logger.info("End Training!")
@@ -493,9 +518,9 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=False, default="test",
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100","custom"], default="cifar10",
+    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "custom"], default="cifar10",
                         help="Which downstream task.")
-    parser.add_argument("--model_type", choices=["ViViT-B/16x2","ViViT-B/16x2-small"],
+    parser.add_argument("--model_type", choices=["ViViT-B/16x2", "ViViT-B/16x2-small", "ViViT-L/16x2"],
                         default="ViViT-L/16x2",
                         help="Which variant to use.")
     parser.add_argument("--pretrained_dir", type=str, default="ViT-B_16.npz",
@@ -503,19 +528,19 @@ def main():
     parser.add_argument("--output_dir", default="output", type=str,
                         help="The output directory where checkpoints will be written.")
     parser.add_argument("--data_dir", default="train", type=str,
-                        help="Path to the data.")
+                        help="Path to the training data.")
     parser.add_argument("--test_dir", default=None, type=str,
-                        help="Path to the test data.")
-    parser.add_argument("--num_classes", default=2, type=int,
-                        help="number of class")
+                        help="Path to the validation data.")
+    parser.add_argument("--num_classes", default=174, type=int,
+                        help="number of classes")
 
     parser.add_argument("--img_size", default=224, type=int,
                         help="Resolution size")
-    parser.add_argument("--num_frames", default=32, type=int,
-                        help="Number of input frame to sample")
-    parser.add_argument("--train_batch_size", default=64, type=int,
+    parser.add_argument("--num_frames", default=16, type=int,
+                        help="Number of input frames to sample")
+    parser.add_argument("--train_batch_size", default=8, type=int,
                         help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size", default=64, type=int,
+    parser.add_argument("--eval_batch_size", default=8, type=int,
                         help="Total batch size for eval.")
 
     parser.add_argument("--learning_rate", default=0.5, type=float,
@@ -524,42 +549,38 @@ def main():
                         help="Weight decay if we apply some.")
     parser.add_argument("--label_smoothing", default=0.3, type=float,
                         help="label smoothing p.")
-    parser.add_argument("--num_epochs", default=10, type=int,
+    parser.add_argument("--num_epochs", default=35, type=int,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--decay_type", choices=["cosine", "linear"], default="cosine",
                         help="How to decay the learning rate.")
     parser.add_argument("--warmup_steps", default=500, type=int,
                         help="Step of training to perform learning rate warmup for.")
     parser.add_argument("--warmup_epochs", default=2.5, type=float,
-                        help="Number of warmup epochs (overrides warmup_steps if > 0). Supports fractional values like 2.5")
+                        help="Number of warmup epochs (overrides warmup_steps if > 0).")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
     parser.add_argument("--save_every", default=1, type=int,
                         help="Save checkpoint every N epochs (0 = only save best).")
     parser.add_argument("--save_every_steps", default=0, type=int,
-                        help="Save checkpoint every N steps during training (0 = disabled). Use for testing resume, e.g., --save_every_steps 10")
+                        help="Save checkpoint every N steps (0 = disabled).")
     parser.add_argument("--eval_every_steps", default=0, type=int,
-                        help="Run quick validation every N steps during training (0 = only at epoch end). Use for debugging, e.g., --eval_every_steps 10")
+                        help="Run quick validation every N steps (0 = only at epoch end).")
 
     # Resume training
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume training from (e.g., output/test_step_10.bin)")
+                        help="Path to checkpoint to resume training from")
 
     parser.add_argument("--local_rank", "--local-rank", type=int, default=-1,
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help="Number of updates steps to accumulate before performing a backward/update pass.")
-    parser.add_argument('--fp16', action='store_true', default=True,
-                        help="Whether to use 16-bit float precision instead of 32-bit")
-    parser.add_argument('--fp16_opt_level', type=str, default='O2',
-                        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
-                             "See details at https://nvidia.github.io/apex/amp.html")
-    parser.add_argument('--loss_scale', type=float, default=0,
-                        help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
-                             "0 (default value): dynamic loss scaling.\n"
-                             "Positive power of 2: static loss scaling value.\n")
+                        help="Number of updates steps to accumulate before backward/update pass.")
+    
+    # FP16 - Uses Native PyTorch AMP (no Apex needed!)
+    parser.add_argument('--fp16', action='store_true', default=False,
+                        help="Whether to use 16-bit float precision (Native PyTorch AMP)")
+
     args = parser.parse_args()
 
     # Handle local_rank from environment variable (for torchrun)
@@ -570,11 +591,10 @@ def main():
     if args.local_rank == -1:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         args.n_gpu = torch.cuda.device_count()
-    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+    else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend='nccl',
-                                             timeout=timedelta(minutes=60))
+        torch.distributed.init_process_group(backend='nccl', timeout=timedelta(minutes=60))
         args.n_gpu = 1
     args.device = device
 
@@ -588,7 +608,7 @@ def main():
     # Set seed
     set_seed(args)
 
-    # Model & Tokenizer Setup
+    # Model Setup
     args, model = setup(args)
 
     # Training

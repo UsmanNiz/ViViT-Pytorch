@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 
@@ -156,20 +157,29 @@ def get_loader(args):
         torch.distributed.barrier()
     if trainset is not None:
         train_sampler = RandomSampler(trainset) if args.local_rank == -1 else DistributedSampler(trainset)
+        # Use multiple workers for data loading to prevent GPU starvation
+        # Set num_workers based on available CPUs, but cap at reasonable number
+        num_workers = args.num_workers if hasattr(args, 'num_workers') and args.num_workers > 0 else min(8, os.cpu_count() or 1)
         train_loader = DataLoader(trainset,
                               sampler=train_sampler,
                               batch_size=args.train_batch_size,
-                              num_workers=0,
-                              pin_memory=True)
+                              num_workers=num_workers,
+                              pin_memory=True,
+                              persistent_workers=True if num_workers > 0 else False,
+                              prefetch_factor=2 if num_workers > 0 else None)
     else:
         train_loader = None
     if testset is not None:
         test_sampler = SequentialSampler(testset)
+        # Use multiple workers for data loading to prevent GPU starvation
+        num_workers = args.num_workers if hasattr(args, 'num_workers') and args.num_workers > 0 else min(4, os.cpu_count() or 1)
         test_loader = DataLoader(testset,
                              sampler=test_sampler,
                              batch_size=args.eval_batch_size,
-                             num_workers=0,
-                             pin_memory=True)
+                             num_workers=num_workers,
+                             pin_memory=True,
+                             persistent_workers=True if num_workers > 0 else False,
+                             prefetch_factor=2 if num_workers > 0 else None)
     else:
         train_loader = None
         

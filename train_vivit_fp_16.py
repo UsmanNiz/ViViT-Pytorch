@@ -315,7 +315,8 @@ def train(args, model):
 
     # Multi-GPU setup
     if args.local_rank != -1:
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+        # Remove find_unused_parameters=True to reduce overhead (only set True if model has unused params)
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
         logger.info(f"Using DistributedDataParallel on GPU {args.local_rank}")
     elif args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
@@ -509,6 +510,10 @@ def main():
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before backward/update pass.")
     
+    # Data loading optimization
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help="Number of data loading workers (0 = single-threaded, higher = more parallel loading)")
+    
     # FP16 - Uses Native PyTorch AMP (no Apex needed!)
     parser.add_argument('--fp16', action='store_true', default=False,
                         help="Whether to use 16-bit float precision (Native PyTorch AMP)")
@@ -529,6 +534,16 @@ def main():
         torch.distributed.init_process_group(backend='nccl', timeout=timedelta(minutes=60))
         args.n_gpu = 1
     args.device = device
+    
+    # Enable CUDA optimizations for faster training
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+        torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for speed
+        # Enable TensorFloat-32 for faster training on Ampere GPUs (A100)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if args.local_rank in [-1, 0]:
+            logger.info("CUDA optimizations enabled: cudnn.benchmark=True, TF32 enabled")
 
     # Setup logging
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
