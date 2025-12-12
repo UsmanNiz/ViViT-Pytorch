@@ -35,6 +35,7 @@ from models.modeling import CONFIGS, ViViTMultiHead
 
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_epic_kitchens_loader
+from utils.regularization import Mixup, mixup_criterion, EMA
 
 
 logger = logging.getLogger(__name__)
@@ -209,7 +210,7 @@ class TextLogger:
 
 
 def save_model(args, model, optimizer, scheduler, scaler, epoch, global_step, 
-               best_metrics, config, best=False, step_checkpoint=False):
+               best_metrics, config, best=False, step_checkpoint=False, ema=None):
     """Save model checkpoint."""
     model_to_save = model.module if hasattr(model, 'module') else model
     
@@ -228,6 +229,7 @@ def save_model(args, model, optimizer, scheduler, scaler, epoch, global_step,
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+        'ema_state_dict': ema.state_dict() if ema is not None else None,
         'best_metrics': best_metrics,
         'args': args,
         'class_splits': model_to_save.class_splits,
@@ -238,7 +240,7 @@ def save_model(args, model, optimizer, scheduler, scaler, epoch, global_step,
     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
 
-def load_checkpoint(args, model, optimizer=None, scheduler=None, scaler=None):
+def load_checkpoint(args, model, optimizer=None, scheduler=None, scaler=None, ema=None):
     """Load checkpoint for resuming training."""
     logger.info(f"Loading checkpoint from {args.resume}")
     checkpoint = torch.load(args.resume, map_location=args.device, weights_only=False)
@@ -254,6 +256,10 @@ def load_checkpoint(args, model, optimizer=None, scheduler=None, scaler=None):
     
     if scaler is not None and checkpoint.get('scaler_state_dict') is not None:
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    
+    if ema is not None and checkpoint.get('ema_state_dict') is not None:
+        ema.load_state_dict(checkpoint['ema_state_dict'])
+        logger.info("Loaded EMA state")
     
     start_epoch = checkpoint.get('epoch', 0)
     global_step = checkpoint.get('global_step', 0)
@@ -271,6 +277,10 @@ def setup(args):
     # Override label smoothing from args if provided
     if hasattr(args, 'label_smoothing'):
         config.label_smoothing = args.label_smoothing
+    
+    # Override stochastic droplayer rate from args
+    if hasattr(args, 'stochastic_droplayer_rate'):
+        config.stochastic_droplayer_rate = args.stochastic_droplayer_rate
     
     # Get class splits from config
     class_splits = config.class_splits if hasattr(config, 'class_splits') else [97, 300]
@@ -438,6 +448,18 @@ def train(args, model, config):
     # FP16 Scaler
     scaler = GradScaler() if args.fp16 else None
     
+    # Mixup augmentation
+    mixup_fn = None
+    if args.mixup_alpha > 0:
+        mixup_fn = Mixup(alpha=args.mixup_alpha, prob=args.mixup_prob)
+        logger.info(f"Using Mixup with alpha={args.mixup_alpha}, prob={args.mixup_prob}")
+    
+    # EMA (Exponential Moving Average)
+    ema = None
+    if args.use_ema:
+        ema = EMA(model, decay=args.ema_decay)
+        logger.info(f"Using EMA with decay={args.ema_decay}")
+    
     # Initialize training state
     start_epoch = 0
     global_step = 0
@@ -450,7 +472,7 @@ def train(args, model, config):
     # Resume from checkpoint
     if args.resume is not None:
         start_epoch, global_step, best_metrics = load_checkpoint(
-            args, model, optimizer, scheduler, scaler
+            args, model, optimizer, scheduler, scaler, ema
         )
         if text_logger:
             text_logger.log_message(f"Resumed from epoch {start_epoch}, step {global_step}")
@@ -493,12 +515,29 @@ def train(args, model, config):
             if videos.dim() == 4:
                 videos = videos.unsqueeze(1).expand(-1, 2, -1, -1, -1)
             
+            # Apply Mixup if enabled
+            mixup_labels = None
+            lam = 1.0
+            if mixup_fn is not None:
+                videos, labels, mixup_labels, lam = mixup_fn(videos, labels)
+            
             # Forward pass
             if args.fp16:
                 with autocast():
-                    loss = model(videos, labels)
+                    if mixup_labels is not None and lam < 1.0:
+                        # Mixup: compute loss as weighted combination
+                        loss1 = model(videos, labels)
+                        loss2 = model(videos, mixup_labels)
+                        loss = lam * loss1 + (1 - lam) * loss2
+                    else:
+                        loss = model(videos, labels)
             else:
-                loss = model(videos, labels)
+                if mixup_labels is not None and lam < 1.0:
+                    loss1 = model(videos, labels)
+                    loss2 = model(videos, mixup_labels)
+                    loss = lam * loss1 + (1 - lam) * loss2
+                else:
+                    loss = model(videos, labels)
             
             # Handle DataParallel
             if args.n_gpu > 1 and args.local_rank == -1:
@@ -530,6 +569,10 @@ def train(args, model, config):
                 optimizer.zero_grad()
                 global_step += 1
                 
+                # Update EMA
+                if ema is not None:
+                    ema.update()
+                
                 epoch_iterator.set_description(
                     f"Epoch {epoch}/{args.num_epochs} (loss={losses.val:.5f}, lr={scheduler.get_lr()[0]:.6f})"
                 )
@@ -554,7 +597,7 @@ def train(args, model, config):
                     if args.local_rank in [-1, 0]:
                         save_model(args, model, optimizer, scheduler, scaler, 
                                   epoch, global_step, best_metrics, config,
-                                  step_checkpoint=True)
+                                  step_checkpoint=True, ema=ema)
         
         # End of epoch
         logger.info(f"Epoch {epoch} - Average Loss: {losses.avg:.5f}")
@@ -562,11 +605,17 @@ def train(args, model, config):
         if args.local_rank in [-1, 0]:
             writer.add_scalar("train/epoch_loss", losses.avg, epoch)
             
-            # Full validation
+            # Full validation (use EMA weights if available)
+            if ema is not None:
+                ema.apply_shadow()
+            
             metrics, val_loss = validate(
                 args, model, test_loader, epoch, global_step,
                 writer=writer, full_eval=True, scaler=scaler
             )
+            
+            if ema is not None:
+                ema.restore()
             
             if text_logger:
                 text_logger.log(global_step, epoch, val_loss, metrics,
@@ -576,7 +625,7 @@ def train(args, model, config):
             if metrics['joint_accuracy'] > best_metrics['joint_accuracy']:
                 best_metrics = metrics.copy()
                 save_model(args, model, optimizer, scheduler, scaler,
-                          epoch, global_step, best_metrics, config, best=True)
+                          epoch, global_step, best_metrics, config, best=True, ema=ema)
                 logger.info(f"New best joint accuracy: {best_metrics['joint_accuracy']:.5f}")
                 if text_logger:
                     text_logger.log_message(f"NEW BEST! Joint: {best_metrics['joint_accuracy']:.5f}")
@@ -584,7 +633,7 @@ def train(args, model, config):
             # Regular checkpoint
             if args.save_every > 0 and epoch % args.save_every == 0:
                 save_model(args, model, optimizer, scheduler, scaler,
-                          epoch, global_step, best_metrics, config)
+                          epoch, global_step, best_metrics, config, ema=ema)
     
     if args.local_rank in [-1, 0]:
         writer.close()
@@ -677,6 +726,18 @@ def main():
     # FP16
     parser.add_argument("--fp16", action='store_true',
                         help="Use FP16 training")
+    
+    # Regularization
+    parser.add_argument("--mixup_alpha", default=0.1, type=float,
+                        help="Mixup alpha (0 to disable, scenic-vivit default: 0.1)")
+    parser.add_argument("--mixup_prob", default=1.0, type=float,
+                        help="Probability of applying mixup")
+    parser.add_argument("--use_ema", action='store_true',
+                        help="Use Exponential Moving Average of model weights")
+    parser.add_argument("--ema_decay", default=0.9999, type=float,
+                        help="EMA decay rate")
+    parser.add_argument("--stochastic_droplayer_rate", default=0.2, type=float,
+                        help="Stochastic depth drop rate (scenic-vivit default: 0.2)")
     
     args = parser.parse_args()
     

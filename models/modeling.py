@@ -174,25 +174,49 @@ class Embeddings3D(nn.Module):
         
         return embeddings
 
+def drop_path(x, drop_prob=0., training=False):
+    """Drop paths (Stochastic Depth) per sample."""
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    output = x.div(keep_prob) * random_tensor
+    return output
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample."""
+    def __init__(self, drop_prob=0.):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+
 class Block(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, drop_path_rate=0.):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn = Mlp(config)
         self.attn = Attention(config, vis)
+        # Stochastic Depth (DropPath)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
     def forward(self, x):
         h = x
         x = self.attention_norm(x)
         x, weights = self.attn(x)
-        x = x + h
+        x = h + self.drop_path(x)  # Apply drop path to residual
 
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
-        x = x + h
+        x = h + self.drop_path(x)  # Apply drop path to residual
         return x, weights
 
     def load_from(self, weights, n_block):
@@ -234,14 +258,19 @@ class Block(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, stochastic_droplayer_rate=0.):
         super(Encoder, self).__init__()
         self.vis = vis
         self.layer = nn.ModuleList()
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
-        for _ in range(config.transformer["num_layers"]):
-            layer = Block(config, vis)
-            self.layer.append(copy.deepcopy(layer))
+        
+        num_layers = config.transformer["num_layers"]
+        # Stochastic depth decay rule - linearly increase drop rate
+        dpr = [x.item() for x in torch.linspace(0, stochastic_droplayer_rate, num_layers)]
+        
+        for i in range(num_layers):
+            layer = Block(config, vis, drop_path_rate=dpr[i])
+            self.layer.append(layer)
 
     def forward(self, hidden_states):
         attn_weights = []
@@ -254,10 +283,10 @@ class Encoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, config, img_size, num_frames, temporal, vis = False):
+    def __init__(self, config, img_size, num_frames, temporal, vis=False, stochastic_droplayer_rate=0.):
         super(Transformer, self).__init__()
-        self.embedding = Embeddings3D(config, img_size=img_size,num_frame=num_frames, temporal=temporal)
-        self.encoder = Encoder(config, vis)
+        self.embedding = Embeddings3D(config, img_size=img_size, num_frame=num_frames, temporal=temporal)
+        self.encoder = Encoder(config, vis, stochastic_droplayer_rate=stochastic_droplayer_rate)
 
     def forward(self, input_ids):
         input_ids = self.embedding(input_ids)
@@ -267,7 +296,7 @@ class Transformer(nn.Module):
 
 
 class MyViViT(nn.Module):
-    def __init__(self, config, image_size=224, num_classes=100, num_frames = 32,  pool = 'cls'):
+    def __init__(self, config, image_size=224, num_classes=100, num_frames=32, pool='cls'):
         super().__init__()
         
         self.image_size = image_size
@@ -277,8 +306,17 @@ class MyViViT(nn.Module):
         self.label_smoothing = config.label_smoothing
         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
-        self.spatial_transformer = Transformer(config.spatial,image_size,num_frames,temporal=False) 
-        self.temporal_transformer = Transformer(config.temporal,image_size,num_frames,temporal = True)       
+        # Get stochastic depth rate from config (default 0)
+        stochastic_droplayer_rate = getattr(config, 'stochastic_droplayer_rate', 0.)
+        
+        self.spatial_transformer = Transformer(
+            config.spatial, image_size, num_frames, temporal=False,
+            stochastic_droplayer_rate=stochastic_droplayer_rate
+        )
+        self.temporal_transformer = Transformer(
+            config.temporal, image_size, num_frames, temporal=True,
+            stochastic_droplayer_rate=0.  # Usually no drop path in temporal transformer
+        )
         self.pool = pool
         self.mlp_head = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
@@ -339,9 +377,18 @@ class ViViTMultiHead(nn.Module):
         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
         self.pool = pool
         
+        # Get stochastic depth rate from config (default 0)
+        stochastic_droplayer_rate = getattr(config, 'stochastic_droplayer_rate', 0.)
+        
         # Shared backbone
-        self.spatial_transformer = Transformer(config.spatial, image_size, num_frames, temporal=False)
-        self.temporal_transformer = Transformer(config.temporal, image_size, num_frames, temporal=True)
+        self.spatial_transformer = Transformer(
+            config.spatial, image_size, num_frames, temporal=False,
+            stochastic_droplayer_rate=stochastic_droplayer_rate
+        )
+        self.temporal_transformer = Transformer(
+            config.temporal, image_size, num_frames, temporal=True,
+            stochastic_droplayer_rate=0.  # Usually no drop path in temporal transformer
+        )
         
         # Layer norm before classification heads
         self.norm = nn.LayerNorm(self.hidden_dim)
