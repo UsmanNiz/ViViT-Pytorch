@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, Sequ
 import subprocess
 import re
 from utils.custom_dataset import CustomDataset
+from utils.epic_kitchens_dataset import EpicKitchensDataset, EpicKitchensDatasetFromFrames
 import random
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
@@ -202,6 +203,112 @@ def get_blackbar(vid_path):
         output = [int(crop.decode('utf8')) for crop in crop_data[0]] 
     
     return output
+
+
+def get_epic_kitchens_loader(args):
+    """
+    Get data loaders for Epic Kitchens dataset.
+    
+    Args:
+        args: Arguments containing:
+            - data_dir: Path to video files
+            - train_annotations: Path to training annotations CSV
+            - val_annotations: Path to validation annotations CSV (optional)
+            - test_annotations: Path to test annotations CSV (optional)
+            - num_frames: Number of frames to sample
+            - class_splits: List of classes per head [verb, noun]
+            - train_batch_size: Training batch size
+            - eval_batch_size: Evaluation batch size
+            - local_rank: For distributed training
+            - use_frames: Whether to load from pre-extracted frames
+    
+    Returns:
+        train_loader, val_loader (or test_loader)
+    """
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()
+    
+    # Get class splits from args or use defaults
+    class_splits = getattr(args, 'class_splits', [97, 300])
+    use_frames = getattr(args, 'use_frames', False)
+    
+    # Select dataset class
+    DatasetClass = EpicKitchensDatasetFromFrames if use_frames else EpicKitchensDataset
+    
+    # Create datasets
+    trainset = None
+    testset = None
+    
+    if hasattr(args, 'train_annotations') and args.train_annotations:
+        trainset = DatasetClass(
+            data_path=args.data_dir,
+            annotations_path=args.train_annotations,
+            num_frames=args.num_frames,
+            transform=data_transforms['train'],
+            split='train',
+            class_splits=class_splits,
+            one_hot_labels=True
+        )
+        logger.info(f"Loaded training set with {len(trainset)} samples")
+    
+    if hasattr(args, 'val_annotations') and args.val_annotations:
+        testset = DatasetClass(
+            data_path=args.test_dir if hasattr(args, 'test_dir') and args.test_dir else args.data_dir,
+            annotations_path=args.val_annotations,
+            num_frames=args.num_frames,
+            transform=data_transforms['val'],
+            split='validation',
+            class_splits=class_splits,
+            one_hot_labels=True
+        )
+        logger.info(f"Loaded validation set with {len(testset)} samples")
+    elif hasattr(args, 'test_annotations') and args.test_annotations:
+        testset = DatasetClass(
+            data_path=args.test_dir if hasattr(args, 'test_dir') and args.test_dir else args.data_dir,
+            annotations_path=args.test_annotations,
+            num_frames=args.num_frames,
+            transform=data_transforms['test'],
+            split='test',
+            class_splits=class_splits,
+            one_hot_labels=True
+        )
+        logger.info(f"Loaded test set with {len(testset)} samples")
+    
+    if args.local_rank == 0:
+        torch.distributed.barrier()
+    
+    # Create data loaders
+    train_loader = None
+    test_loader = None
+    
+    if trainset is not None:
+        train_sampler = RandomSampler(trainset) if args.local_rank == -1 else DistributedSampler(trainset)
+        num_workers = getattr(args, 'num_workers', min(8, os.cpu_count() or 1))
+        train_loader = DataLoader(
+            trainset,
+            sampler=train_sampler,
+            batch_size=args.train_batch_size,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None,
+            drop_last=True  # Important for batch norm
+        )
+    
+    if testset is not None:
+        test_sampler = SequentialSampler(testset)
+        num_workers = getattr(args, 'num_workers', min(4, os.cpu_count() or 1))
+        test_loader = DataLoader(
+            testset,
+            sampler=test_sampler,
+            batch_size=args.eval_batch_size,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
+    
+    return train_loader, test_loader
 
 
 
