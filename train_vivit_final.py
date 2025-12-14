@@ -1,7 +1,13 @@
 # coding=utf-8
 """
-ViViT Training Script with Native PyTorch AMP (No Apex Required!)
-Now with text file logging!
+ViViT Training Script with Epic Kitchens Support and Full Regularization
+
+Supports:
+- Standard classification (SSv2, Kinetics, etc.)
+- Epic Kitchens multi-head classification (verb + noun -> action)
+- Mixup augmentation
+- Label smoothing
+- All ViViT paper regularization (Table 7)
 """
 from __future__ import absolute_import, division, print_function
 
@@ -10,28 +16,156 @@ import argparse
 import os
 import random
 import numpy as np
-from datetime import timedelta, datetime
+from datetime import timedelta
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler  # Native PyTorch AMP - No Apex needed!
+from torch.cuda.amp import autocast, GradScaler
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
 from models.modeling import CONFIGS, MyViViT
-
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
-from utils.data_utils import get_loader
+from utils.data_utils import get_loader, DATASET_CONFIGS
 from utils.dist_util import get_world_size
 
 
 logger = logging.getLogger(__name__)
 
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
+# =============================================================================
+# Epic Kitchens Multi-Head Functions
+# =============================================================================
+
+def epic_kitchens_loss(logits, labels, class_splits, label_smoothing=0.0):
+    """
+    Compute loss for Epic Kitchens multi-head classification.
+    
+    Args:
+        logits: [B, 397] model outputs
+        labels: [B, 397] one-hot labels (noun | verb concatenated)
+        class_splits: cumulative splits [300, 397]
+        label_smoothing: smoothing factor
+    
+    Returns:
+        Average of noun and verb cross-entropy losses
+    """
+    # Split logits and labels
+    noun_logits = logits[:, :class_splits[0]]  # [B, 300]
+    verb_logits = logits[:, class_splits[0]:]  # [B, 97]
+    
+    noun_labels = labels[:, :class_splits[0]]
+    verb_labels = labels[:, class_splits[0]:]
+    
+    # Check if soft labels (from mixup)
+    is_soft = noun_labels.sum(dim=-1).mean() > 1.01
+    
+    if is_soft:
+        # Soft cross-entropy for mixup
+        noun_log_probs = F.log_softmax(noun_logits, dim=-1)
+        verb_log_probs = F.log_softmax(verb_logits, dim=-1)
+        
+        noun_loss = -(noun_labels * noun_log_probs).sum(dim=-1).mean()
+        verb_loss = -(verb_labels * verb_log_probs).sum(dim=-1).mean()
+    else:
+        # Standard cross-entropy
+        noun_targets = noun_labels.argmax(dim=-1)
+        verb_targets = verb_labels.argmax(dim=-1)
+        
+        noun_loss = F.cross_entropy(noun_logits, noun_targets, label_smoothing=label_smoothing)
+        verb_loss = F.cross_entropy(verb_logits, verb_targets, label_smoothing=label_smoothing)
+    
+    return (noun_loss + verb_loss) / 2
+
+
+def epic_kitchens_accuracy(logits, labels, class_splits):
+    """
+    Compute accuracies for Epic Kitchens.
+    
+    Returns:
+        action_acc: Both noun AND verb correct (primary metric)
+        noun_acc: Noun Top-1 accuracy
+        verb_acc: Verb Top-1 accuracy
+    """
+    noun_logits = logits[:, :class_splits[0]]
+    verb_logits = logits[:, class_splits[0]:]
+    
+    noun_labels = labels[:, :class_splits[0]]
+    verb_labels = labels[:, class_splits[0]:]
+    
+    noun_pred = noun_logits.argmax(dim=-1)
+    verb_pred = verb_logits.argmax(dim=-1)
+    
+    noun_true = noun_labels.argmax(dim=-1)
+    verb_true = verb_labels.argmax(dim=-1)
+    
+    noun_correct = (noun_pred == noun_true)
+    verb_correct = (verb_pred == verb_true)
+    action_correct = noun_correct & verb_correct
+    
+    return (
+        action_correct.float().mean().item(),
+        noun_correct.float().mean().item(),
+        verb_correct.float().mean().item()
+    )
+
+
+# =============================================================================
+# Mixup Implementation
+# =============================================================================
+
+def mixup_data(x, y, alpha, is_onehot=False):
+    """
+    Apply mixup augmentation.
+    
+    Args:
+        x: Input tensor [B, ...]
+        y: Labels - [B] for class indices, [B, C] for one-hot
+        alpha: Beta distribution parameter (0 = no mixup)
+        is_onehot: Whether y is already one-hot encoded
+    
+    Returns:
+        mixed_x, mixed_y, lambda
+    """
+    if alpha <= 0:
+        return x, y, 1.0
+    
+    batch_size = x.size(0)
+    lam = np.random.beta(alpha, alpha)
+    
+    # Random permutation for mixing pairs
+    index = torch.randperm(batch_size, device=x.device)
+    
+    # Mix inputs
+    mixed_x = lam * x + (1 - lam) * x[index]
+    
+    # Mix labels
+    if is_onehot:
+        mixed_y = lam * y + (1 - lam) * y[index]
+    else:
+        # Return tuple for standard classification
+        mixed_y = (y, y[index], lam)
+    
+    return mixed_x, mixed_y, lam
+
+
+def mixup_criterion(logits, y_tuple, label_smoothing=0.0):
+    """Compute mixup loss for standard classification."""
+    y_a, y_b, lam = y_tuple
+    loss_a = F.cross_entropy(logits, y_a, label_smoothing=label_smoothing)
+    loss_b = F.cross_entropy(logits, y_b, label_smoothing=label_smoothing)
+    return lam * loss_a + (1 - lam) * loss_b
+
+
+# =============================================================================
+# Utility Classes
+# =============================================================================
+
+class AverageMeter:
+    """Computes and stores the average and current value."""
     def __init__(self):
         self.reset()
 
@@ -48,140 +182,70 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-class TextLogger:
-    """Simple text file logger for training metrics"""
-    def __init__(self, log_path, args):
-        self.log_path = log_path
-        self.file = open(log_path, "a")  # Append mode for resume
-        
-        # Write header
-        self.file.write("=" * 100 + "\n")
-        self.file.write(f"Training started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        self.file.write(f"Experiment: {args.name}\n")
-        self.file.write("-" * 100 + "\n")
-        self.file.write(f"Model: {args.model_type}\n")
-        self.file.write(f"Dataset: {args.dataset}\n")
-        self.file.write(f"Num classes: {args.num_classes}\n")
-        self.file.write(f"Num frames: {args.num_frames}\n")
-        self.file.write(f"Batch size: {args.train_batch_size}\n")
-        self.file.write(f"Learning rate: {args.learning_rate}\n")
-        self.file.write(f"Label smoothing: {args.label_smoothing}\n")
-        self.file.write(f"Warmup epochs: {args.warmup_epochs}\n")
-        self.file.write(f"Total epochs: {args.num_epochs}\n")
-        self.file.write(f"FP16: {args.fp16}\n")
-        self.file.write("=" * 100 + "\n\n")
-        
-        # Write column headers
-        self.file.write(f"{'Step':<10}{'Epoch':<8}{'Train Loss':<14}{'Val Loss':<14}{'Top1 Acc':<12}{'Top5 Acc':<12}{'LR':<14}{'Note'}\n")
-        self.file.write("-" * 100 + "\n")
-        self.file.flush()
-    
-    def log(self, step, epoch, train_loss, val_loss, top1_acc, top5_acc, lr, note=""):
-        self.file.write(f"{step:<10}{epoch:<8}{train_loss:<14.5f}{val_loss:<14.5f}{top1_acc:<12.5f}{top5_acc:<12.5f}{lr:<14.8f}{note}\n")
-        self.file.flush()
-    
-    def log_message(self, message):
-        self.file.write(f">>> {message}\n")
-        self.file.flush()
-    
-    def close(self, best_top1_acc, best_top5_acc):
-        self.file.write("\n" + "=" * 100 + "\n")
-        self.file.write(f"Training completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        self.file.write(f"Best Top-1 Accuracy: {best_top1_acc:.5f}\n")
-        self.file.write(f"Best Top-5 Accuracy: {best_top5_acc:.5f}\n")
-        self.file.write("=" * 100 + "\n")
-        self.file.close()
-
-
 def simple_accuracy(preds, labels):
     return (preds == labels).mean()
 
 
 def top_k_accuracy(logits, labels, k=5):
-    """
-    Computes top-k accuracy.
-    """
     top_k_preds = np.argsort(logits, axis=1)[:, -k:]
-    correct = 0
-    for i, label in enumerate(labels):
-        if label in top_k_preds[i]:
-            correct += 1
+    correct = sum(1 for i, label in enumerate(labels) if label in top_k_preds[i])
     return correct / len(labels)
 
 
-def save_model(args, model, optimizer, scheduler, scaler, epoch, global_step, best_top1_acc, best_top5_acc, best=False, step_checkpoint=False):
-    """
-    Save model checkpoint with all training state for resume capability.
-    """
-    config = CONFIGS[args.model_type]
-    config.num_classes = args.num_classes
-    config.img_size = args.img_size
-    config.num_frames = args.num_frames
-    
+def save_model(args, model, optimizer, scheduler, scaler, epoch, global_step, 
+               best_acc, best=False, step_checkpoint=False):
+    """Save model checkpoint."""
     model_to_save = model.module if hasattr(model, 'module') else model
     
     if best:
-        model_checkpoint = os.path.join(args.output_dir, "%s_best.pth" % args.name)
+        path = os.path.join(args.output_dir, f"{args.name}_best.pth")
     elif step_checkpoint:
-        model_checkpoint = os.path.join(args.output_dir, "%s_step_%d.pth" % (args.name, global_step))
+        path = os.path.join(args.output_dir, f"{args.name}_step_{global_step}.pth")
     else:
-        model_checkpoint = os.path.join(args.output_dir, "%s_epoch_%d.pth" % (args.name, epoch))
+        path = os.path.join(args.output_dir, f"{args.name}_epoch_{epoch}.pth")
     
     checkpoint = {
-        'config': config,
         'epoch': epoch,
         'global_step': global_step,
         'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
-        'best_top1_acc': best_top1_acc,
-        'best_top5_acc': best_top5_acc,
+        'scaler_state_dict': scaler.state_dict() if scaler else None,
+        'best_acc': best_acc,
         'args': args,
     }
     
-    torch.save(checkpoint, model_checkpoint)
-    logger.info("Saved model checkpoint to [%s]", model_checkpoint)
+    torch.save(checkpoint, path)
+    logger.info(f"Saved checkpoint to {path}")
 
 
 def load_checkpoint(args, model, optimizer=None, scheduler=None, scaler=None):
-    """
-    Load checkpoint for resuming training.
-    """
-    logger.info(f"Loading checkpoint from {args.resume}")
+    """Load checkpoint for resuming."""
     checkpoint = torch.load(args.resume, map_location=args.device, weights_only=False)
     
     model_to_load = model.module if hasattr(model, 'module') else model
     model_to_load.load_state_dict(checkpoint['model_state_dict'])
     
-    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+    if optimizer and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        logger.info("Loaded optimizer state")
-    
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+    if scheduler and 'scheduler_state_dict' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        logger.info("Loaded scheduler state")
-    
-    if scaler is not None and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+    if scaler and checkpoint.get('scaler_state_dict'):
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        logger.info("Loaded scaler state")
     
-    start_epoch = checkpoint.get('epoch', 0)
-    global_step = checkpoint.get('global_step', 0)
-    best_top1_acc = checkpoint.get('best_top1_acc', 0)
-    best_top5_acc = checkpoint.get('best_top5_acc', 0)
-    
-    logger.info(f"Resumed from epoch {start_epoch}, global_step {global_step}")
-    logger.info(f"Best Top-1 Acc: {best_top1_acc:.5f}, Best Top-5 Acc: {best_top5_acc:.5f}")
-    
-    return start_epoch, global_step, best_top1_acc, best_top5_acc
+    return (
+        checkpoint.get('epoch', 0),
+        checkpoint.get('global_step', 0),
+        checkpoint.get('best_acc', 0)
+    )
 
 
 def setup(args):
+    """Setup model."""
     config = CONFIGS[args.model_type]
     config.label_smoothing = args.label_smoothing
-
-    if args.dataset == "cifar10" or args.dataset == "cifar100":
+    
+    if args.dataset in ["cifar10", "cifar100"]:
         num_frames = 2
         num_classes = 10 if args.dataset == "cifar10" else 100
     else:
@@ -194,19 +258,11 @@ def setup(args):
         model.load_from(np.load(args.pretrained_dir))
     
     model.to(args.device)
-    num_params = count_parameters(model)
-
-    logger.info("{}".format(config))
-    logger.info("Training parameters %s", args)
-    logger.info("Total Parameter: \t%2.1fM" % num_params)
-    print(num_params)
-
-    return args, model
-
-
-def count_parameters(model):
-    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return params/1000000
+    
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    logger.info(f"Model: {args.model_type}, Parameters: {num_params:.1f}M")
+    
+    return model
 
 
 def set_seed(args):
@@ -217,180 +273,167 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def valid(args, model, writer, test_loader, epoch, global_step, full_eval=True, scaler=None):
-    """
-    Run validation with optional FP16.
-    Returns: top1_accuracy, top5_accuracy, val_loss
-    """
-    eval_losses = AverageMeter()
+# =============================================================================
+# Validation
+# =============================================================================
 
-    if full_eval:
-        logger.info("***** Running Validation *****")
-        logger.info("  Num steps = %d", len(test_loader))
-        logger.info("  Batch size = %d", args.eval_batch_size)
-
+def validate(args, model, test_loader, epoch, global_step, writer, full_eval=True):
+    """Run validation."""
     model.eval()
-    all_preds, all_label, all_logits = [], [], []
+    
+    is_epic = args.dataset == 'epic_kitchens' and args.class_splits is not None
+    if is_epic:
+        class_splits = np.cumsum(args.class_splits).tolist()
+    
+    losses = AverageMeter()
+    
+    if is_epic:
+        action_acc_meter = AverageMeter()
+        noun_acc_meter = AverageMeter()
+        verb_acc_meter = AverageMeter()
+    else:
+        all_preds, all_labels, all_logits = [], [], []
     
     max_batches = len(test_loader) if full_eval else min(10, len(test_loader))
     
-    epoch_iterator = tqdm(test_loader,
-                          desc="Validating... (loss=X.X)",
-                          bar_format="{l_bar}{r_bar}",
-                          dynamic_ncols=True,
-                          disable=args.local_rank not in [-1, 0] or not full_eval)
+    iterator = tqdm(test_loader, desc="Validating", disable=args.local_rank not in [-1, 0] or not full_eval)
     
-    loss_fct = torch.nn.CrossEntropyLoss()
-    for step, batch in enumerate(epoch_iterator):
+    for step, batch in enumerate(iterator):
         if step >= max_batches:
             break
-            
-        batch = tuple(t.to(args.device) for t in batch)
-        x, y = batch
         
-        if x.dim() == 4:
-            x = torch.unsqueeze(x, 1)
-            x = x.expand(-1, 2, -1, -1, -1)
-            
+        x, y = tuple(t.to(args.device) for t in batch)
+        
         with torch.no_grad():
-            # Use autocast for validation too if fp16 is enabled
             if args.fp16:
                 with autocast():
                     logits = model(x)
-                    eval_loss = loss_fct(logits, y)
             else:
                 logits = model(x)
-                eval_loss = loss_fct(logits, y)
-
-            eval_losses.update(eval_loss.item())
-            preds = torch.argmax(logits, dim=-1)
-
-        if len(all_preds) == 0:
-            all_preds.append(preds.detach().cpu().numpy())
-            all_label.append(y.detach().cpu().numpy())
-            all_logits.append(logits.float().detach().cpu().numpy())  # Convert to float for numpy
-        else:
-            all_preds[0] = np.append(all_preds[0], preds.detach().cpu().numpy(), axis=0)
-            all_label[0] = np.append(all_label[0], y.detach().cpu().numpy(), axis=0)
-            all_logits[0] = np.append(all_logits[0], logits.float().detach().cpu().numpy(), axis=0)
             
-        if full_eval:
-            epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
-
-    all_preds, all_label, all_logits = all_preds[0], all_label[0], all_logits[0]
+            if is_epic:
+                loss = epic_kitchens_loss(logits, y, class_splits)
+                action_acc, noun_acc, verb_acc = epic_kitchens_accuracy(logits, y, class_splits)
+                
+                losses.update(loss.item(), x.size(0))
+                action_acc_meter.update(action_acc, x.size(0))
+                noun_acc_meter.update(noun_acc, x.size(0))
+                verb_acc_meter.update(verb_acc, x.size(0))
+            else:
+                loss = F.cross_entropy(logits, y)
+                losses.update(loss.item(), x.size(0))
+                
+                preds = logits.argmax(dim=-1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(y.cpu().numpy())
+                all_logits.extend(logits.float().cpu().numpy())
     
-    top1_accuracy = simple_accuracy(all_preds, all_label)
-    num_classes = all_logits.shape[1]
-    k = min(5, num_classes)
-    top5_accuracy = top_k_accuracy(all_logits, all_label, k=k)
-
-    if full_eval:
-        logger.info("\n")
-        logger.info("Validation Results - Epoch %d" % epoch)
-        logger.info("Valid Loss: %2.5f" % eval_losses.avg)
-        logger.info("Valid Top-1 Accuracy: %2.5f" % top1_accuracy)
-        logger.info("Valid Top-5 Accuracy: %2.5f" % top5_accuracy)
-
-        writer.add_scalar("val/top1_accuracy", scalar_value=top1_accuracy, global_step=global_step)
-        writer.add_scalar("val/top5_accuracy", scalar_value=top5_accuracy, global_step=global_step)
-        writer.add_scalar("val/loss", scalar_value=eval_losses.avg, global_step=global_step)
+    # Compute final metrics
+    if is_epic:
+        if full_eval and args.local_rank in [-1, 0]:
+            logger.info(f"\nValidation Results - Epoch {epoch}")
+            logger.info(f"Loss: {losses.avg:.5f}")
+            logger.info(f"Action Accuracy: {action_acc_meter.avg:.5f}")
+            logger.info(f"Noun Accuracy: {noun_acc_meter.avg:.5f}")
+            logger.info(f"Verb Accuracy: {verb_acc_meter.avg:.5f}")
+            
+            writer.add_scalar("val/loss", losses.avg, global_step)
+            writer.add_scalar("val/action_accuracy", action_acc_meter.avg, global_step)
+            writer.add_scalar("val/noun_accuracy", noun_acc_meter.avg, global_step)
+            writer.add_scalar("val/verb_accuracy", verb_acc_meter.avg, global_step)
+        
+        model.train()
+        return action_acc_meter.avg
     else:
-        logger.info(f"[Step {global_step}] Quick Eval - Loss: {eval_losses.avg:.5f}, Top-1 Acc: {top1_accuracy:.5f}, Top-5 Acc: {top5_accuracy:.5f}")
-        writer.add_scalar("val/quick_top1_accuracy", scalar_value=top1_accuracy, global_step=global_step)
-        writer.add_scalar("val/quick_top5_accuracy", scalar_value=top5_accuracy, global_step=global_step)
-    
-    model.train()
-    
-    return top1_accuracy, top5_accuracy, eval_losses.avg
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+        all_logits = np.array(all_logits)
+        
+        top1_acc = simple_accuracy(all_preds, all_labels)
+        top5_acc = top_k_accuracy(all_logits, all_labels, k=min(5, all_logits.shape[1]))
+        
+        if full_eval and args.local_rank in [-1, 0]:
+            logger.info(f"\nValidation Results - Epoch {epoch}")
+            logger.info(f"Loss: {losses.avg:.5f}")
+            logger.info(f"Top-1 Accuracy: {top1_acc:.5f}")
+            logger.info(f"Top-5 Accuracy: {top5_acc:.5f}")
+            
+            writer.add_scalar("val/loss", losses.avg, global_step)
+            writer.add_scalar("val/top1_accuracy", top1_acc, global_step)
+            writer.add_scalar("val/top5_accuracy", top5_acc, global_step)
+        
+        model.train()
+        return top1_acc
 
+
+# =============================================================================
+# Training
+# =============================================================================
 
 def train(args, model):
-    """ Train the model """
-    text_logger = None
-    
+    """Main training loop."""
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
-        
-        # Initialize text logger
-        log_file_path = os.path.join(args.output_dir, f"{args.name}_training_log.txt")
-        text_logger = TextLogger(log_file_path, args)
-        logger.info(f"Text log will be saved to: {log_file_path}")
-
+    
+    # Adjust batch size for gradient accumulation
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
-
-    # Prepare dataset
+    
+    # Dataset setup
+    is_epic = args.dataset == 'epic_kitchens' and args.class_splits is not None
+    if is_epic:
+        class_splits = np.cumsum(args.class_splits).tolist()
+        logger.info(f"Epic Kitchens: {args.class_splits[0]} nouns + {args.class_splits[1]} verbs")
+    
+    # Get mixup alpha
+    mixup_alpha = getattr(args, 'mixup_alpha', 0.0)
+    
+    # Load data
     train_loader, test_loader = get_loader(args)
-
-    # Calculate total steps based on epochs
+    
+    # Calculate steps
     steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
     t_total = steps_per_epoch * args.num_epochs
-
-    # Calculate warmup steps
-    if args.warmup_epochs > 0:
-        warmup_steps = int(steps_per_epoch * args.warmup_epochs)
-        logger.info(f"Using warmup_epochs={args.warmup_epochs}, calculated warmup_steps={warmup_steps}")
-    else:
-        warmup_steps = args.warmup_steps
-        logger.info(f"Using warmup_steps={warmup_steps}")
-
-    # Prepare optimizer and scheduler
-    optimizer = torch.optim.SGD(model.parameters(),
-                                lr=args.learning_rate,
-                                momentum=0.9,
-                                weight_decay=args.weight_decay)
     
-    if args.decay_type == "cosine":
-        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
-    else:
-        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
-
-    # Initialize GradScaler for FP16 training (Native PyTorch AMP)
+    warmup_steps = int(steps_per_epoch * args.warmup_epochs) if args.warmup_epochs > 0 else args.warmup_steps
+    
+    # Optimizer and scheduler
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=args.learning_rate,
+        momentum=0.9,
+        weight_decay=args.weight_decay
+    )
+    
+    scheduler = WarmupCosineSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total) \
+        if args.decay_type == "cosine" else \
+        WarmupLinearSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
+    
+    # FP16 scaler
     scaler = GradScaler() if args.fp16 else None
-    if args.fp16:
-        logger.info("Using Native PyTorch AMP (FP16 training enabled)")
-
-    # Initialize training state
-    start_epoch = 0
-    global_step = 0
-    best_top1_acc = 0
-    best_top5_acc = 0
-    resume_step_in_epoch = 0
-
-    # Resume from checkpoint if specified
-    if args.resume is not None:
-        start_epoch, global_step, best_top1_acc, best_top5_acc = load_checkpoint(
-            args, model, optimizer, scheduler, scaler
-        )
-        resume_step_in_epoch = global_step % steps_per_epoch
-        if resume_step_in_epoch > 0:
-            logger.info(f"Will skip first {resume_step_in_epoch} steps in epoch {start_epoch + 1}")
-        if text_logger:
-            text_logger.log_message(f"Resumed from epoch {start_epoch}, step {global_step}")
-
-    # Multi-GPU setup
+    
+    # Resume
+    start_epoch, global_step, best_acc = 0, 0, 0
+    if args.resume:
+        start_epoch, global_step, best_acc = load_checkpoint(args, model, optimizer, scheduler, scaler)
+    
+    # Distributed
     if args.local_rank != -1:
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-        logger.info(f"Using DistributedDataParallel on GPU {args.local_rank}")
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
     elif args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
-        logger.info(f"Using DataParallel on {args.n_gpu} GPUs")
-
-    # Train!
-    logger.info("***** Running training *****")
-    logger.info("  Num epochs = %d", args.num_epochs)
-    logger.info("  Start epoch = %d", start_epoch + 1)
-    logger.info("  Steps per epoch = %d", steps_per_epoch)
-    logger.info("  Total optimization steps = %d", t_total)
-    logger.info("  Warmup steps = %d", warmup_steps)
-    logger.info("  FP16 training = %s", args.fp16)
-    logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
-    logger.info("  Number of GPUs = %d", args.n_gpu if args.local_rank == -1 else torch.distributed.get_world_size())
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                args.train_batch_size * args.gradient_accumulation_steps * (
-                    torch.distributed.get_world_size() if args.local_rank != -1 else max(1, args.n_gpu)))
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-
+    
+    # Training info
+    logger.info("***** Training *****")
+    logger.info(f"  Dataset: {args.dataset}")
+    logger.info(f"  Epochs: {args.num_epochs}")
+    logger.info(f"  Batch size: {args.train_batch_size * args.gradient_accumulation_steps}")
+    logger.info(f"  Steps/epoch: {steps_per_epoch}")
+    logger.info(f"  Total steps: {t_total}")
+    logger.info(f"  Warmup steps: {warmup_steps}")
+    logger.info(f"  Label smoothing: {args.label_smoothing}")
+    logger.info(f"  Mixup alpha: {mixup_alpha}")
+    
     model.zero_grad()
     set_seed(args)
     
@@ -401,47 +444,52 @@ def train(args, model):
         if args.local_rank != -1:
             train_loader.sampler.set_epoch(epoch)
         
-        epoch_iterator = tqdm(train_loader,
-                              desc=f"Epoch {epoch}/{args.num_epochs} (loss=X.X)",
-                              bar_format="{l_bar}{r_bar}",
-                              dynamic_ncols=True,
-                              disable=args.local_rank not in [-1, 0])
+        iterator = tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs}",
+                       disable=args.local_rank not in [-1, 0])
         
-        for step, batch in enumerate(epoch_iterator):
-            if epoch == start_epoch + 1 and step < resume_step_in_epoch:
-                continue
+        for step, batch in enumerate(iterator):
+            x, y = tuple(t.to(args.device) for t in batch)
             
-            batch = tuple(t.to(args.device) for t in batch)
-            x, y = batch
+            # Apply mixup
+            if mixup_alpha > 0:
+                x, y, lam = mixup_data(x, y, mixup_alpha, is_onehot=is_epic)
             
-            if x.dim() == 4:
-                x = torch.unsqueeze(x, 1)
-                x = x.expand(-1, 2, -1, -1, -1)
-            
-            # Forward pass with autocast for FP16
+            # Forward
             if args.fp16:
                 with autocast():
-                    loss = model(x, y)
+                    logits = model(x)
+                    
+                    if is_epic:
+                        loss = epic_kitchens_loss(logits, y, class_splits, args.label_smoothing)
+                    elif mixup_alpha > 0:
+                        loss = mixup_criterion(logits, y, args.label_smoothing)
+                    else:
+                        loss = F.cross_entropy(logits, y, label_smoothing=args.label_smoothing)
             else:
-                loss = model(x, y)
+                logits = model(x)
+                
+                if is_epic:
+                    loss = epic_kitchens_loss(logits, y, class_splits, args.label_smoothing)
+                elif mixup_alpha > 0:
+                    loss = mixup_criterion(logits, y, args.label_smoothing)
+                else:
+                    loss = F.cross_entropy(logits, y, label_smoothing=args.label_smoothing)
             
-            # Handle DataParallel
             if args.n_gpu > 1 and args.local_rank == -1:
                 loss = loss.mean()
-
+            
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
             
-            # Backward pass
+            # Backward
             if args.fp16:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-
+            
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 losses.update(loss.item() * args.gradient_accumulation_steps)
                 
-                # Gradient clipping and optimizer step
                 if args.fp16:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -454,164 +502,158 @@ def train(args, model):
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
-
-                epoch_iterator.set_description(
-                    f"Epoch {epoch}/{args.num_epochs} (loss={losses.val:.5f}, lr={scheduler.get_lr()[0]:.6f})"
+                
+                iterator.set_description(
+                    f"Epoch {epoch}/{args.num_epochs} (loss={losses.val:.4f}, lr={scheduler.get_lr()[0]:.6f})"
                 )
                 
                 if args.local_rank in [-1, 0]:
-                    writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
-                    writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                    writer.add_scalar("train/loss", losses.val, global_step)
+                    writer.add_scalar("train/lr", scheduler.get_lr()[0], global_step)
                 
-                # Quick evaluation
+                # Quick eval
                 if args.eval_every_steps > 0 and global_step % args.eval_every_steps == 0:
                     if args.local_rank in [-1, 0]:
-                        top1, top5, val_loss = valid(args, model, writer, test_loader, epoch, global_step, full_eval=False, scaler=scaler)
-                        # Log to text file
-                        if text_logger:
-                            text_logger.log(global_step, epoch, losses.val, val_loss, top1, top5, scheduler.get_lr()[0], "quick_eval")
+                        validate(args, model, test_loader, epoch, global_step, writer, full_eval=False)
                 
-                # Save checkpoint
+                # Step checkpoint
                 if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                     if args.local_rank in [-1, 0]:
                         save_model(args, model, optimizer, scheduler, scaler, epoch, global_step,
-                                  best_top1_acc, best_top5_acc, best=False, step_checkpoint=True)
-
-        resume_step_in_epoch = 0
-        logger.info(f"Epoch {epoch}/{args.num_epochs} completed - Average Loss: {losses.avg:.5f}")
+                                  best_acc, step_checkpoint=True)
+        
+        # Epoch end
+        logger.info(f"Epoch {epoch} - Loss: {losses.avg:.5f}")
         
         if args.local_rank in [-1, 0]:
-            writer.add_scalar("train/epoch_loss", scalar_value=losses.avg, global_step=epoch)
+            writer.add_scalar("train/epoch_loss", losses.avg, epoch)
             
-            top1_accuracy, top5_accuracy, val_loss = valid(args, model, writer, test_loader, epoch, global_step, full_eval=True, scaler=scaler)
+            # Full validation
+            val_acc = validate(args, model, test_loader, epoch, global_step, writer, full_eval=True)
             
-            # Log epoch end to text file
-            if text_logger:
-                text_logger.log(global_step, epoch, losses.avg, val_loss, top1_accuracy, top5_accuracy, scheduler.get_lr()[0], "EPOCH_END")
+            # Save best
+            if val_acc > best_acc:
+                save_model(args, model, optimizer, scheduler, scaler, epoch, global_step, val_acc, best=True)
+                best_acc = val_acc
+                logger.info(f"New best accuracy: {best_acc:.5f}")
             
-            if best_top1_acc < top1_accuracy:
-                save_model(args, model, optimizer, scheduler, scaler, epoch, global_step, 
-                          top1_accuracy, top5_accuracy, best=True)
-                best_top1_acc = top1_accuracy
-                best_top5_acc = top5_accuracy
-                logger.info(f"New best Top-1 accuracy: {best_top1_acc:.5f}, Top-5 accuracy: {best_top5_acc:.5f}")
-                if text_logger:
-                    text_logger.log_message(f"NEW BEST MODEL! Top-1: {best_top1_acc:.5f}, Top-5: {best_top5_acc:.5f}")
-            
+            # Epoch checkpoint
             if args.save_every > 0 and epoch % args.save_every == 0:
-                save_model(args, model, optimizer, scheduler, scaler, epoch, global_step,
-                          best_top1_acc, best_top5_acc, best=False)
-
+                save_model(args, model, optimizer, scheduler, scaler, epoch, global_step, best_acc)
+    
     if args.local_rank in [-1, 0]:
         writer.close()
-        if text_logger:
-            text_logger.close(best_top1_acc, best_top5_acc)
-            logger.info(f"Training log saved to: {log_file_path}")
     
-    logger.info("Best Top-1 Accuracy: \t%f" % best_top1_acc)
-    logger.info("Best Top-5 Accuracy: \t%f" % best_top5_acc)
-    logger.info("End Training!")
+    logger.info(f"Best Accuracy: {best_acc:.5f}")
+    logger.info("Training complete!")
 
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser()
-    # Required parameters
-    parser.add_argument("--name", required=False, default="test",
-                        help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "custom"], default="cifar10",
-                        help="Which downstream task.")
-    parser.add_argument("--model_type", choices=["ViViT-B/16x2", "ViViT-B/16x2-small", "ViViT-L/16x2"],
-                        default="ViViT-L/16x2",
-                        help="Which variant to use.")
-    parser.add_argument("--pretrained_dir", type=str, default="ViT-B_16.npz",
-                        help="Where to search for pretrained ViT models.")
-    parser.add_argument("--output_dir", default="output", type=str,
-                        help="The output directory where checkpoints will be written.")
-    parser.add_argument("--data_dir", default="train", type=str,
-                        help="Path to the training data.")
-    parser.add_argument("--test_dir", default=None, type=str,
-                        help="Path to the validation data.")
-    parser.add_argument("--num_classes", default=174, type=int,
-                        help="number of classes")
-
-    parser.add_argument("--img_size", default=224, type=int,
-                        help="Resolution size")
-    parser.add_argument("--num_frames", default=16, type=int,
-                        help="Number of input frames to sample")
-    parser.add_argument("--train_batch_size", default=8, type=int,
-                        help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size", default=8, type=int,
-                        help="Total batch size for eval.")
-
-    parser.add_argument("--learning_rate", default=0.5, type=float,
-                        help="The initial learning rate for SGD.")
-    parser.add_argument("--weight_decay", default=0, type=float,
-                        help="Weight decay if we apply some.")
-    parser.add_argument("--label_smoothing", default=0.3, type=float,
-                        help="label smoothing p.")
-    parser.add_argument("--num_epochs", default=35, type=int,
-                        help="Total number of training epochs to perform.")
-    parser.add_argument("--decay_type", choices=["cosine", "linear"], default="cosine",
-                        help="How to decay the learning rate.")
-    parser.add_argument("--warmup_steps", default=500, type=int,
-                        help="Step of training to perform learning rate warmup for.")
-    parser.add_argument("--warmup_epochs", default=2.5, type=float,
-                        help="Number of warmup epochs (overrides warmup_steps if > 0).")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float,
-                        help="Max gradient norm.")
-    parser.add_argument("--save_every", default=1, type=int,
-                        help="Save checkpoint every N epochs (0 = only save best).")
-    parser.add_argument("--save_every_steps", default=0, type=int,
-                        help="Save checkpoint every N steps (0 = disabled).")
-    parser.add_argument("--eval_every_steps", default=0, type=int,
-                        help="Run quick validation every N steps (0 = only at epoch end).")
-
-    # Resume training
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume training from")
-
-    parser.add_argument("--local_rank", "--local-rank", type=int, default=-1,
-                        help="local_rank for distributed training on gpus")
-    parser.add_argument('--seed', type=int, default=42,
-                        help="random seed for initialization")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help="Number of updates steps to accumulate before backward/update pass.")
     
-    # FP16 - Uses Native PyTorch AMP (no Apex needed!)
-    parser.add_argument('--fp16', action='store_true', default=False,
-                        help="Whether to use 16-bit float precision (Native PyTorch AMP)")
-
+    # Basic
+    parser.add_argument("--name", default="vivit", help="Run name")
+    parser.add_argument("--dataset", default="custom",
+                        choices=["cifar10", "cifar100", "custom", "epic_kitchens", "ssv2",
+                                "kinetics400", "kinetics600", "moments_in_time"])
+    parser.add_argument("--model_type", default="ViViT-B/16x2",
+                        choices=["ViViT-B/16x2", "ViViT-B/16x2-small", "ViViT-L/16x2"])
+    parser.add_argument("--pretrained_dir", default="ViT-B_16.npz")
+    parser.add_argument("--output_dir", default="output")
+    parser.add_argument("--data_dir", default="train")
+    parser.add_argument("--test_dir", default=None)
+    
+    # Model
+    parser.add_argument("--num_classes", type=int, default=174)
+    parser.add_argument("--img_size", type=int, default=224)
+    parser.add_argument("--num_frames", type=int, default=32)
+    parser.add_argument("--class_splits", type=int, nargs='+', default=None,
+                        help="For Epic Kitchens: 300 97")
+    
+    # Training
+    parser.add_argument("--train_batch_size", type=int, default=64)
+    parser.add_argument("--eval_batch_size", type=int, default=64)
+    parser.add_argument("--learning_rate", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--num_epochs", type=int, default=30)
+    parser.add_argument("--decay_type", default="cosine", choices=["cosine", "linear"])
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--warmup_epochs", type=float, default=2.5)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    
+    # Regularization
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--mixup_alpha", type=float, default=0.0)
+    
+    # Checkpointing
+    parser.add_argument("--save_every", type=int, default=1)
+    parser.add_argument("--save_every_steps", type=int, default=0)
+    parser.add_argument("--eval_every_steps", type=int, default=0)
+    parser.add_argument("--resume", type=str, default=None)
+    
+    # Distributed
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=-1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--fp16", action="store_true")
+    
+    # Augmentation flag
+    parser.add_argument("--use_vivit_aug", action="store_true",
+                        help="Use ViViT paper augmentations")
+    
     args = parser.parse_args()
-
-    # Handle local_rank from environment variable (for torchrun)
+    
+    # Handle torchrun
     if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])
-
-    # Setup CUDA, GPU & distributed training
+    
+    # Apply dataset defaults
+    if args.dataset in DATASET_CONFIGS:
+        config = DATASET_CONFIGS[args.dataset]
+        if args.class_splits is None and 'class_splits' in config:
+            args.class_splits = config['class_splits']
+        if args.num_classes == 174:
+            args.num_classes = config.get('num_classes', 174)
+    
+    # Epic Kitchens validation
+    if args.dataset == 'epic_kitchens':
+        if args.class_splits is None:
+            args.class_splits = [300, 97]
+        args.num_classes = sum(args.class_splits)
+    
+    # CUDA setup
     if args.local_rank == -1:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         args.n_gpu = torch.cuda.device_count()
     else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', timeout=timedelta(minutes=60))
+        dist.init_process_group(backend='nccl', timeout=timedelta(minutes=60))
         args.n_gpu = 1
     args.device = device
-
-    # Setup logging
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
-                   (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
-
-    # Set seed
+    
+    # CUDA optimizations
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    
+    # Logging
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        datefmt='%m/%d/%Y %H:%M:%S',
+        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN
+    )
+    
+    logger.info(f"Device: {args.device}, GPUs: {args.n_gpu}, FP16: {args.fp16}")
+    
     set_seed(args)
-
-    # Model Setup
-    args, model = setup(args)
-
-    # Training
+    model = setup(args)
     train(args, model)
 
 

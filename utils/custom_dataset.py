@@ -69,6 +69,7 @@ class CustomDataset(torch.utils.data.Dataset):
 		transform: data augmentation
 		sample_method: tubelet or uniform sampling
   		blackbar_check: check for existance of black bar in input video
+		class_splits: For Epic Kitchens multi-head [num_nouns, num_verbs] e.g. [300, 97]
 	"""
 
 	def __init__(self,
@@ -78,7 +79,8 @@ class CustomDataset(torch.utils.data.Dataset):
 				 tubelet_size=2,
 				 transform=None,
 				 sample_method="tubelet",
-     			 blackbar_check=None):
+     			 blackbar_check=None,
+				 class_splits=None):
 		# self.configs = configs
 		self.labels = pd.read_csv(label_path) if label_path != None else None
 		self.label_path = label_path
@@ -90,6 +92,24 @@ class CustomDataset(torch.utils.data.Dataset):
 		self.num_frames = num_frames
 		self.v_decoder = DecordInit()
 		self.blackbar_check = blackbar_check
+		self.class_splits = class_splits
+		
+		# Detect label format
+		self.label_format = None
+		if self.labels is not None:
+			if 'noun_id' in self.labels.columns and 'verb_id' in self.labels.columns:
+				self.label_format = 'epic_kitchens'
+			elif 'liveness_score' in self.labels.columns:
+				self.label_format = 'liveness'
+			elif 'label' in self.labels.columns:
+				self.label_format = 'standard'
+			else:
+				# Try to find any numeric column that could be a label
+				for col in self.labels.columns:
+					if col != 'fname' and self.labels[col].dtype in ['int64', 'int32', 'float64', 'float32']:
+						self.label_format = 'generic'
+						self.label_column = col
+						break
 
 	def __getitem__(self, index):
 		while True:
@@ -127,7 +147,30 @@ class CustomDataset(torch.utils.data.Dataset):
 		# print(f"[DEBUG __getitem__] Applying transforms to video: {vid}")
 		with torch.no_grad():
 			if self.label_path != None:
-				label = self.labels[self.labels["fname"] == vid]["liveness_score"].item()
+				row = self.labels[self.labels["fname"] == vid]
+				
+				if self.label_format == 'epic_kitchens':
+					# Epic Kitchens: create one-hot encoded label [noun_onehot | verb_onehot]
+					noun_id = int(row["noun_id"].item())
+					verb_id = int(row["verb_id"].item())
+					
+					if self.class_splits is not None:
+						num_nouns, num_verbs = self.class_splits[0], self.class_splits[1]
+					else:
+						num_nouns, num_verbs = 300, 97  # Default Epic Kitchens 100
+					
+					label = torch.zeros(num_nouns + num_verbs, dtype=torch.float32)
+					label[noun_id] = 1.0
+					label[num_nouns + verb_id] = 1.0
+				elif self.label_format == 'liveness':
+					label = row["liveness_score"].item()
+				elif self.label_format == 'standard':
+					label = int(row["label"].item())
+				elif self.label_format == 'generic':
+					label = row[self.label_column].item()
+				else:
+					raise ValueError(f"Unknown label format. Columns: {self.labels.columns.tolist()}")
+				
 				video = torch.tensor(video, dtype=torch.float32)
 			else:
 				label = None

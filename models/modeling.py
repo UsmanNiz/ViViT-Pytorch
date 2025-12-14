@@ -174,49 +174,53 @@ class Embeddings3D(nn.Module):
         
         return embeddings
 
-def drop_path(x, drop_prob=0., training=False):
-    """Drop paths (Stochastic Depth) per sample."""
-    if drop_prob == 0. or not training:
-        return x
-    keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-    random_tensor.floor_()
-    output = x.div(keep_prob) * random_tensor
-    return output
-
-
-class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample."""
-    def __init__(self, drop_prob=0.):
-        super(DropPath, self).__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x):
-        return drop_path(x, self.drop_prob, self.training)
-
-
 class Block(nn.Module):
-    def __init__(self, config, vis, drop_path_rate=0.):
+    def __init__(self, config, vis, droplayer_p=0.0):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn = Mlp(config)
         self.attn = Attention(config, vis)
-        # Stochastic Depth (DropPath)
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+        self.droplayer_p = droplayer_p
+
+    def get_drop_pattern(self, x, training):
+        """Generate per-sample drop pattern following Scenic implementation.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, hidden_dim)
+            training: Boolean indicating training mode
+            
+        Returns:
+            Drop pattern tensor of shape (batch_size, 1, 1) or 0.0
+        """
+        if training and self.droplayer_p > 0.0:
+            # Per-sample dropping: shape (batch_size, 1, 1) for broadcasting
+            shape = (x.shape[0], 1, 1)
+            drop_pattern = torch.bernoulli(
+                torch.full(shape, self.droplayer_p, device=x.device, dtype=x.dtype)
+            )
+            return drop_pattern
+        return 0.0
 
     def forward(self, x):
+        # Attention block with stochastic depth
         h = x
         x = self.attention_norm(x)
         x, weights = self.attn(x)
-        x = h + self.drop_path(x)  # Apply drop path to residual
+        
+        # Apply stochastic depth to attention skip connection
+        drop_pattern = self.get_drop_pattern(x, self.training)
+        x = x * (1.0 - drop_pattern) + h
 
+        # MLP block with stochastic depth
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
-        x = h + self.drop_path(x)  # Apply drop path to residual
+        
+        # Apply stochastic depth to MLP skip connection
+        drop_pattern = self.get_drop_pattern(x, self.training)
+        x = x * (1.0 - drop_pattern) + h
         return x, weights
 
     def load_from(self, weights, n_block):
@@ -258,18 +262,19 @@ class Block(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, config, vis, stochastic_droplayer_rate=0.):
+    def __init__(self, config, vis):
         super(Encoder, self).__init__()
         self.vis = vis
         self.layer = nn.ModuleList()
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
         
         num_layers = config.transformer["num_layers"]
-        # Stochastic depth decay rule - linearly increase drop rate
-        dpr = [x.item() for x in torch.linspace(0, stochastic_droplayer_rate, num_layers)]
+        stochastic_droplayer_rate = config.transformer.get("stochastic_droplayer_rate", 0.0)
         
-        for i in range(num_layers):
-            layer = Block(config, vis, drop_path_rate=dpr[i])
+        for lyr in range(num_layers):
+            # Linear drop rate scheduling: 0 at first layer, stochastic_droplayer_rate at last
+            droplayer_p = (lyr / max(num_layers - 1, 1)) * stochastic_droplayer_rate
+            layer = Block(config, vis, droplayer_p=droplayer_p)
             self.layer.append(layer)
 
     def forward(self, hidden_states):
@@ -283,10 +288,10 @@ class Encoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, config, img_size, num_frames, temporal, vis=False, stochastic_droplayer_rate=0.):
+    def __init__(self, config, img_size, num_frames, temporal, vis = False):
         super(Transformer, self).__init__()
-        self.embedding = Embeddings3D(config, img_size=img_size, num_frame=num_frames, temporal=temporal)
-        self.encoder = Encoder(config, vis, stochastic_droplayer_rate=stochastic_droplayer_rate)
+        self.embedding = Embeddings3D(config, img_size=img_size,num_frame=num_frames, temporal=temporal)
+        self.encoder = Encoder(config, vis)
 
     def forward(self, input_ids):
         input_ids = self.embedding(input_ids)
@@ -296,7 +301,7 @@ class Transformer(nn.Module):
 
 
 class MyViViT(nn.Module):
-    def __init__(self, config, image_size=224, num_classes=100, num_frames=32, pool='cls'):
+    def __init__(self, config, image_size=224, num_classes=100, num_frames = 32,  pool = 'cls'):
         super().__init__()
         
         self.image_size = image_size
@@ -306,17 +311,8 @@ class MyViViT(nn.Module):
         self.label_smoothing = config.label_smoothing
         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
-        # Get stochastic depth rate from config (default 0)
-        stochastic_droplayer_rate = getattr(config, 'stochastic_droplayer_rate', 0.)
-        
-        self.spatial_transformer = Transformer(
-            config.spatial, image_size, num_frames, temporal=False,
-            stochastic_droplayer_rate=stochastic_droplayer_rate
-        )
-        self.temporal_transformer = Transformer(
-            config.temporal, image_size, num_frames, temporal=True,
-            stochastic_droplayer_rate=0.  # Usually no drop path in temporal transformer
-        )
+        self.spatial_transformer = Transformer(config.spatial,image_size,num_frames,temporal=False) 
+        self.temporal_transformer = Transformer(config.temporal,image_size,num_frames,temporal = True)       
         self.pool = pool
         self.mlp_head = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
@@ -336,232 +332,6 @@ class MyViViT(nn.Module):
             return loss        
         else:            
             return logits
-
-
-class ViViTMultiHead(nn.Module):
-    """
-    ViViT with Multi-Head Classification for Epic Kitchens dataset.
-    
-    This model supports predicting multiple classes simultaneously (e.g., noun and verb)
-    using separate classification heads that share the same backbone.
-    
-    Args:
-        config: Model configuration
-        image_size: Input image size (default: 224)
-        class_splits: List of number of classes per head, e.g., [300, 97] for noun and verb
-                      Default order matches scenic-vivit: [noun, verb]
-        split_names: Names for each split, e.g., ['noun', 'verb']
-        num_frames: Number of input frames (default: 32)
-        pool: Pooling method - 'cls' or 'mean' (default: 'cls')
-    """
-    def __init__(self, config, image_size=224, class_splits=[300, 97], 
-                 split_names=None, num_frames=32, pool='cls'):
-        super().__init__()
-        
-        self.image_size = image_size
-        self.hidden_dim = config.hidden_size
-        self.num_frames = num_frames
-        self.class_splits = class_splits
-        self.num_classes = sum(class_splits)  # Total number of classes
-        self.label_smoothing = config.label_smoothing
-        
-        # Split names for logging (default order: noun, verb to match scenic-vivit)
-        if split_names is None:
-            self.split_names = ['noun', 'verb'] if len(class_splits) == 2 else [f'head_{i}' for i in range(len(class_splits))]
-        else:
-            self.split_names = split_names
-            
-        # Cumulative splits for indexing logits
-        self.cumulative_splits = np.cumsum([0] + class_splits).tolist()
-        
-        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
-        self.pool = pool
-        
-        # Get stochastic depth rate from config (default 0)
-        stochastic_droplayer_rate = getattr(config, 'stochastic_droplayer_rate', 0.)
-        
-        # Shared backbone
-        self.spatial_transformer = Transformer(
-            config.spatial, image_size, num_frames, temporal=False,
-            stochastic_droplayer_rate=stochastic_droplayer_rate
-        )
-        self.temporal_transformer = Transformer(
-            config.temporal, image_size, num_frames, temporal=True,
-            stochastic_droplayer_rate=0.  # Usually no drop path in temporal transformer
-        )
-        
-        # Layer norm before classification heads
-        self.norm = nn.LayerNorm(self.hidden_dim)
-        
-        # Separate classification heads for each split
-        self.classification_heads = nn.ModuleList([
-            nn.Linear(self.hidden_dim, num_cls) for num_cls in class_splits
-        ])
-        
-        # Initialize classification heads with zeros (like in scenic-vivit)
-        for head in self.classification_heads:
-            nn.init.zeros_(head.weight)
-            nn.init.zeros_(head.bias)
-    
-    def get_features(self, x):
-        """Extract features from the backbone without classification."""
-        x = x.permute(0, 2, 3, 4, 1)
-        x = self.spatial_transformer(x)
-        x = self.temporal_transformer(x)
-        x = x.mean(dim=1) if self.pool == 'mean' else x[:, 0]
-        x = self.norm(x)
-        return x
-    
-    def forward(self, x, labels=None, return_features=False):
-        """
-        Forward pass.
-        
-        Args:
-            x: Input tensor of shape (B, C, T, H, W)
-            labels: Optional labels tensor. For training, can be:
-                    - One-hot encoded concatenated labels of shape (B, num_classes)
-                    - Or dict with keys matching split_names containing class indices
-            return_features: If True, also return features before classification
-            
-        Returns:
-            If labels is None: logits tensor of shape (B, num_classes) (concatenated)
-            If labels is not None: total loss (averaged across heads)
-        """
-        # Get features from backbone
-        features = self.get_features(x)
-        
-        # Get logits from each head
-        logits_list = [head(features) for head in self.classification_heads]
-        
-        # Concatenate logits (same format as scenic-vivit)
-        logits = torch.cat(logits_list, dim=-1)
-        
-        if labels is not None:
-            # Calculate loss for each head
-            total_loss = 0.0
-            
-            if isinstance(labels, dict):
-                # Labels provided as dict with split names
-                for i, (head_logits, name) in enumerate(zip(logits_list, self.split_names)):
-                    if name in labels:
-                        loss_fct = CrossEntropyLoss(label_smoothing=self.label_smoothing)
-                        total_loss += loss_fct(head_logits, labels[name])
-            else:
-                # Labels provided as one-hot concatenated tensor
-                for i, head_logits in enumerate(logits_list):
-                    start_idx = self.cumulative_splits[i]
-                    end_idx = self.cumulative_splits[i + 1]
-                    
-                    # Extract one-hot labels for this head
-                    head_labels = labels[:, start_idx:end_idx]
-                    
-                    # Convert one-hot to class indices
-                    head_labels_idx = head_labels.argmax(dim=-1)
-                    
-                    loss_fct = CrossEntropyLoss(label_smoothing=self.label_smoothing)
-                    total_loss += loss_fct(head_logits, head_labels_idx)
-            
-            # Average loss across heads
-            total_loss = total_loss / len(self.class_splits)
-            
-            if return_features:
-                return total_loss, features
-            return total_loss
-        else:
-            if return_features:
-                return logits, features
-            return logits
-    
-    def get_per_head_logits(self, logits):
-        """
-        Split concatenated logits into per-head logits.
-        
-        Args:
-            logits: Concatenated logits of shape (B, num_classes)
-            
-        Returns:
-            List of logits tensors, one per head
-        """
-        return torch.split(logits, self.class_splits, dim=-1)
-    
-    def get_per_head_predictions(self, logits):
-        """
-        Get predictions for each head.
-        
-        Args:
-            logits: Concatenated logits of shape (B, num_classes)
-            
-        Returns:
-            Dict mapping split names to predicted class indices
-        """
-        logits_list = self.get_per_head_logits(logits)
-        predictions = {}
-        for name, head_logits in zip(self.split_names, logits_list):
-            predictions[name] = torch.argmax(head_logits, dim=-1)
-        return predictions
-
-    def prepare_conv3d_weight(self, weights, method):
-        # Prepare kernel weights
-        kernel_w = np2th(weights["embedding/kernel"], conv=True)
-        expanding_dim = self.spatial_transformer.embedding.tubelet_embedding.weight.shape[4]
-        # Prepare bias weights
-        bias_w = np2th(weights["embedding/bias"])
-        
-        if method == "central_frame_initializer":
-            init_index = expanding_dim // 2
-            pad_w = torch.zeros(self.spatial_transformer.embedding.tubelet_embedding.weight.shape)
-            pad_w[:, :, :, :, init_index] = kernel_w
-            kernel_w = pad_w
-        else:
-            kernel_w = torch.unsqueeze(kernel_w, 4)
-            kernel_w = kernel_w.expand(-1, -1, -1, -1, expanding_dim)
-            kernel_w = torch.div(kernel_w, expanding_dim)
-    
-        self.spatial_transformer.embedding.tubelet_embedding.weight.copy_(kernel_w)
-        self.spatial_transformer.embedding.tubelet_embedding.bias.copy_(bias_w)
-        
-        return
-
-    def load_temporal_positional_encoding(self, restored_posemb_old, n_tokens):
-        restored_posemb = np.squeeze(restored_posemb_old)
-        zoom = (n_tokens / restored_posemb.shape[0], 1)
-        restored_posemb = scipy.ndimage.zoom(restored_posemb, zoom, order=1)
-        restored_posemb = np.expand_dims(restored_posemb, axis=0)
-        return restored_posemb
-
-    def load_from(self, weights):
-        """Load pretrained weights from ViT checkpoint."""
-        with torch.no_grad():
-            self.prepare_conv3d_weight(weights, method="central_frame_initializer")
-            self.spatial_transformer.embedding.cls_token.copy_(np2th(weights["cls"]))
-            self.temporal_transformer.embedding.cls_token.copy_(np2th(weights["cls"]))
-            
-            self.spatial_transformer.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
-            self.spatial_transformer.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
-            
-            self.temporal_transformer.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
-            self.temporal_transformer.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
-
-            posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
-            posemb_temporal = self.load_temporal_positional_encoding(posemb, self.temporal_transformer.embedding.position_embeddings.shape[1])
-            
-            posemb_spatial = self.spatial_transformer.embedding.position_embeddings
-            if posemb.size() != posemb_spatial.size():
-                expand_factor = (posemb_spatial.shape[1] - 1) // (posemb.shape[1] - 1)
-                cls_token_weight = torch.unsqueeze(posemb[:, 0, :], 0)
-                tubelet_weight = posemb[:, 1:, :].repeat(1, expand_factor, 1)
-                posemb = torch.cat((cls_token_weight, tubelet_weight), dim=1)
-
-            self.spatial_transformer.embedding.position_embeddings.copy_(posemb)
-            self.temporal_transformer.embedding.position_embeddings.copy_(np2th(posemb_temporal))
-            
-            for bname, block in self.spatial_transformer.encoder.named_children():
-                for uname, unit in block.named_children():
-                    unit.load_from(weights, n_block=uname)
-                    
-            for bname, block in self.temporal_transformer.encoder.named_children():
-                for uname, unit in block.named_children():
-                    unit.load_from(weights, n_block=uname)
 
     def prepare_conv3d_weight(self, weights, method):
         # Prepare kernel weights
@@ -631,7 +401,5 @@ class ViViTMultiHead(nn.Module):
 CONFIGS = {
     'ViViT-B/16x2': configs.get_vb16_config(),
     'ViViT-B/16x2-small': configs.get_vb16_config_small(),
-    'ViViT-L/16x2': configs.get_vl16_config(),
-    'ViViT-L/16x2-EK': configs.get_epic_kitchens_config(),
-    'ViViT-B/16x2-EK': configs.get_vb16_epic_kitchens_config(),
+    'ViViT-L/16x2': configs.get_vl16_config()
 }
